@@ -62,7 +62,8 @@ def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def get_sp500_tickers() -> list[str]:
+@st.cache_data(ttl=3600)
+def get_sp500_universe_df() -> pd.DataFrame:
     errors: list[str] = []
 
     # Prefer a simple CSV endpoint first (typically more stable than HTML scraping).
@@ -72,10 +73,17 @@ def get_sp500_tickers() -> list[str]:
             "s-and-p-500-companies/master/data/constituents.csv"
         )
         df = pd.read_csv(csv_url)
-        if "Symbol" in df.columns:
-            tickers = [t.replace(".", "-") for t in df["Symbol"].astype(str).tolist()]
-            if tickers:
-                return sorted(set(tickers))
+        if "Symbol" in df.columns and "Security" in df.columns:
+            out = pd.DataFrame(
+                {
+                    "ticker": df["Symbol"].astype(str).str.strip().str.upper().str.replace(".", "-", regex=False),
+                    "company_name": df["Security"].astype(str).str.strip(),
+                }
+            )
+            out = out[(out["ticker"] != "") & (out["company_name"] != "")]
+            out = out.drop_duplicates(subset=["ticker"], keep="first").sort_values(["company_name", "ticker"])
+            if not out.empty:
+                return out.reset_index(drop=True)
     except Exception as exc:
         errors.append(f"github csv: {exc}")
 
@@ -88,9 +96,23 @@ def get_sp500_tickers() -> list[str]:
         with urlopen(req, timeout=20) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
         table = pd.read_html(StringIO(html))[0]
-        tickers = [t.replace(".", "-") for t in table["Symbol"].astype(str).tolist()]
-        if tickers:
-            return sorted(set(tickers))
+        if "Symbol" in table.columns:
+            security_col = "Security" if "Security" in table.columns else None
+            if security_col is None:
+                security_col = "GICS Sub-Industry" if "GICS Sub-Industry" in table.columns else None
+            if security_col is None:
+                security_col = "Symbol"
+
+            out = pd.DataFrame(
+                {
+                    "ticker": table["Symbol"].astype(str).str.strip().str.upper().str.replace(".", "-", regex=False),
+                    "company_name": table[security_col].astype(str).str.strip(),
+                }
+            )
+            out = out[(out["ticker"] != "") & (out["company_name"] != "")]
+            out = out.drop_duplicates(subset=["ticker"], keep="first").sort_values(["company_name", "ticker"])
+            if not out.empty:
+                return out.reset_index(drop=True)
     except (HTTPError, URLError, Exception) as exc:
         errors.append(f"wikipedia: {exc}")
 
@@ -99,6 +121,10 @@ def get_sp500_tickers() -> list[str]:
         f"Unable to fetch S&P 500 constituents ({detail}). "
         "Use Custom tickers as a fallback."
     )
+
+
+def get_sp500_tickers() -> list[str]:
+    return get_sp500_universe_df()["ticker"].tolist()
 
 
 def zscore(value: float, mean: float, std: float) -> float:
@@ -142,7 +168,8 @@ def normalized_score_from_raw(raw: pd.Series) -> pd.Series:
     # Preferred normalization: percentile rank within current universe.
     if len(valid) >= 2 and valid.nunique() > 1:
         try:
-            pct = (valid.rank(method="average") - 1) / (len(valid) - 1) * 100.0
+            # Use min-rank so large tie groups at the bottom stay near 0 instead of mid-percentile.
+            pct = (valid.rank(method="min") - 1) / (len(valid) - 1) * 100.0
             out.loc[valid.index] = pct
             return out
         except Exception:
@@ -890,6 +917,35 @@ def main() -> None:
                 f"{len(missing_tickers)} tickers were unavailable from the market data provider in this run. "
                 f"Examples: {preview}{extra}"
             )
+
+        st.subheader("All US Stocks (S&P 500)")
+        all_stocks_query = st.text_input(
+            "Search all stocks (ticker or company name)",
+            value="",
+            key="all_stocks_search",
+            placeholder="e.g., NVDA or NVIDIA",
+        ).strip().upper()
+        try:
+            universe_df = get_sp500_universe_df()
+            score_cols = ranked[["ticker", "activity_score", "market_activity_score", "info_flow_score"]].copy()
+            all_stocks = universe_df.merge(score_cols, on="ticker", how="left")
+            all_stocks = all_stocks.sort_values(["company_name", "ticker"]).reset_index(drop=True)
+
+            if all_stocks_query:
+                all_stocks = all_stocks[
+                    all_stocks["ticker"].str.contains(all_stocks_query, na=False)
+                    | all_stocks["company_name"].str.upper().str.contains(all_stocks_query, na=False)
+                ]
+            st.dataframe(
+                all_stocks[
+                    ["company_name", "ticker", "activity_score", "market_activity_score", "info_flow_score"]
+                ],
+                use_container_width=True,
+                hide_index=True,
+                height=320,
+            )
+        except Exception as exc:
+            st.warning(f"Unable to load S&P 500 name list: {exc}")
 
         col1, col2 = st.columns([1.5, 1])
         with col1:
