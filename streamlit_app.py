@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
@@ -110,6 +111,64 @@ def clamp_0_100(value: float) -> int:
     return int(max(0, min(100, round(value))))
 
 
+def robust_zscore(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").fillna(0.0).astype(float)
+    if s.empty:
+        return s
+
+    med = float(s.median())
+    mad = float((s - med).abs().median())
+    scale = 1.4826 * mad
+    if scale <= 1e-9:
+        std = float(s.std(ddof=0))
+        scale = std if std > 1e-9 else 1.0
+    z = (s - med) / scale
+    return z.clip(lower=-4.0, upper=4.0)
+
+
+def logistic_score(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").fillna(0.0).astype(float)
+    scaled = s.clip(lower=-8.0, upper=8.0)
+    return 100.0 / (1.0 + (-scaled).map(math.exp))
+
+
+def normalized_score_from_raw(raw: pd.Series) -> pd.Series:
+    s = pd.to_numeric(raw, errors="coerce").astype(float)
+    out = pd.Series(50.0, index=s.index, dtype=float)
+    valid = s.dropna()
+    if valid.empty:
+        return out
+
+    # Preferred normalization: percentile rank within current universe.
+    if len(valid) >= 2 and valid.nunique() > 1:
+        try:
+            pct = (valid.rank(method="average") - 1) / (len(valid) - 1) * 100.0
+            out.loc[valid.index] = pct
+            return out
+        except Exception:
+            pass
+
+    # Stable behavior for identical values across a universe.
+    if len(valid) > 1 and valid.nunique() <= 1:
+        out.loc[valid.index] = 50.0
+        return out
+
+    # Fallback for cases where percentile isn't meaningful (e.g., single ticker).
+    out.loc[valid.index] = logistic_score(valid)
+    return out
+
+
+def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "market_activity_score" not in out.columns:
+        out["market_activity_score"] = 50.0
+    if "info_flow_score" not in out.columns:
+        out["info_flow_score"] = 50.0
+    if "activity_score" not in out.columns:
+        out["activity_score"] = (0.65 * out["market_activity_score"] + 0.35 * out["info_flow_score"]).round().astype(int)
+    return out
+
+
 def extract_latest_metrics(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
 
@@ -150,45 +209,104 @@ def extract_latest_metrics(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFram
     return pd.DataFrame(rows)
 
 
-def fetch_single_ticker_metric(ticker: str) -> pd.DataFrame:
+def _compute_metric_from_ohlcv(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame:
+    if ohlcv is None or ohlcv.empty:
+        return pd.DataFrame()
+    cols = {str(c).lower(): c for c in ohlcv.columns}
+    close_col = cols.get("close")
+    vol_col = cols.get("volume")
+    if close_col is None or vol_col is None:
+        return pd.DataFrame()
+
+    close = pd.to_numeric(ohlcv[close_col], errors="coerce").dropna()
+    volume = pd.to_numeric(ohlcv[vol_col], errors="coerce").dropna()
+    if len(close) < 2 or len(volume) < 2:
+        return pd.DataFrame()
+
+    latest_close = float(close.iloc[-1])
+    prev_close = float(close.iloc[-2])
+    latest_volume = float(volume.iloc[-1])
+    baseline_window = volume.iloc[-21:-1] if len(volume) >= 21 else volume.iloc[:-1]
+    baseline_med = float(baseline_window.median()) if len(baseline_window) else latest_volume
+    move_pct = ((latest_close - prev_close) / prev_close) * 100 if prev_close else 0.0
+    vol_ratio = latest_volume / baseline_med if baseline_med > 0 else 1.0
+
+    return pd.DataFrame(
+        [
+            {
+                "ticker": ticker,
+                "price": latest_close,
+                "price_move_pct": move_pct,
+                "volume_ratio": vol_ratio,
+            }
+        ]
+    )
+
+
+def _download_yahoo_daily(tickers: list[str], retries: int = 3) -> pd.DataFrame:
+    wait = 0.5
+    for attempt in range(retries):
+        try:
+            raw = yf.download(
+                tickers=tickers,
+                period="2mo",
+                interval="1d",
+                group_by="column",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            df = extract_latest_metrics(raw, tickers)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+        if attempt < retries - 1:
+            time.sleep(wait)
+            wait *= 2
+    return pd.DataFrame()
+
+
+def _fetch_stooq_single_ticker_metric(ticker: str) -> pd.DataFrame:
+    # Stooq format expects "<symbol>.us" for US listings.
+    symbol = ticker.lower().replace("-", ".")
+    url = f"https://stooq.com/q/d/l/?s={symbol}.us&i=d"
     try:
-        raw = yf.download(
-            tickers=ticker,
-            period="2mo",
-            interval="1d",
-            group_by="column",
-            auto_adjust=False,
-            progress=False,
-            threads=True,
-        )
-        return extract_latest_metrics(raw, [ticker])
+        df = pd.read_csv(url)
     except Exception:
         return pd.DataFrame()
+    if df.empty or "Close" not in df.columns or str(df.iloc[0].get("Close", "")).lower() == "null":
+        return pd.DataFrame()
+    return _compute_metric_from_ohlcv(ticker, df)
+
+
+def fetch_single_ticker_metric(ticker: str) -> pd.DataFrame:
+    yahoo_df = _download_yahoo_daily([ticker], retries=3)
+    if not yahoo_df.empty:
+        return yahoo_df
+    return _fetch_stooq_single_ticker_metric(ticker)
 
 
 def score_base_metrics(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    abs_move = df["price_move_pct"].abs()
-
-    move_mean, move_std = abs_move.mean(), abs_move.std(ddof=0)
-    vol_mean, vol_std = df["volume_ratio"].mean(), df["volume_ratio"].std(ddof=0)
-
-    base_scores = []
-    for _, row in df.iterrows():
-        move_component = max(0.0, zscore(abs(row["price_move_pct"]), move_mean, move_std))
-        vol_component = max(0.0, zscore(row["volume_ratio"], vol_mean, vol_std))
-
-        boost = 0.0
-        if abs(row["price_move_pct"]) >= 2.0 and row["volume_ratio"] > 1.5:
-            boost += 0.8
-
-        raw = 45 + (15 * move_component) + (12 * vol_component) + (16 * boost)
-        base_scores.append(clamp_0_100(raw))
-
     out = df.copy()
-    out["activity_score"] = base_scores
+    abs_move = pd.to_numeric(out["price_move_pct"], errors="coerce").abs().fillna(0.0)
+    vol_ratio = pd.to_numeric(out["volume_ratio"], errors="coerce").fillna(1.0)
+    vol_excess = (vol_ratio - 1.0).clip(lower=0.0)
+
+    move_z = robust_zscore(abs_move)
+    vol_z = robust_zscore(vol_excess)
+    combo_flag = ((abs_move >= 2.0) & (vol_ratio > 1.5)).astype(float)
+
+    raw_market = (0.70 * move_z) + (0.30 * vol_z) + (0.35 * combo_flag)
+    out["raw_market_activity"] = raw_market
+    out["market_activity_score"] = normalized_score_from_raw(raw_market).round(1)
+
+    # Placeholder until news metrics are merged.
+    out["info_flow_score"] = 50.0
+    out["activity_score"] = (0.65 * out["market_activity_score"] + 0.35 * out["info_flow_score"]).round().astype(int)
     return out
 
 
@@ -254,34 +372,28 @@ def apply_news_adjustments(df: pd.DataFrame, news: dict[str, dict[str, Any]]) ->
         return df
 
     out = df.copy()
-    out["mention_count"] = out["ticker"].map(lambda t: news.get(t, {}).get("mention_count", 0))
-    out["source_diversity"] = out["ticker"].map(lambda t: news.get(t, {}).get("source_diversity", 0))
+    out["mention_count"] = out["ticker"].map(lambda t: news.get(t, {}).get("mention_count", 0)).fillna(0)
+    out["source_diversity"] = out["ticker"].map(lambda t: news.get(t, {}).get("source_diversity", 0)).fillna(0)
     out["filing_flag"] = out["ticker"].map(lambda t: bool(news.get(t, {}).get("filing_flag", False)))
-    out["sentiment_shift"] = out["ticker"].map(lambda t: float(news.get(t, {}).get("sentiment_shift", 0.0)))
+    out["sentiment_shift"] = out["ticker"].map(lambda t: float(news.get(t, {}).get("sentiment_shift", 0.0))).fillna(0.0)
 
-    mention_q90 = max(float(out["mention_count"].quantile(0.9)), 1.0)
-    diversity_q90 = max(float(out["source_diversity"].quantile(0.9)), 1.0)
-    sentiment_q90 = max(float(out["sentiment_shift"].quantile(0.9)), 0.1)
+    mention_log = out["mention_count"].map(lambda x: math.log1p(max(0.0, float(x))))
+    source_log = out["source_diversity"].map(lambda x: math.log1p(max(0.0, float(x))))
+    sent_abs = pd.to_numeric(out["sentiment_shift"], errors="coerce").abs().fillna(0.0)
+    filing_num = out["filing_flag"].astype(float)
 
-    adjusted = []
-    for _, row in out.iterrows():
-        score = float(row["activity_score"])
-        mention_norm = min(1.0, math.log1p(row["mention_count"]) / math.log1p(mention_q90))
-        diversity_norm = min(1.0, row["source_diversity"] / diversity_q90)
-        sentiment_norm = min(1.0, row["sentiment_shift"] / sentiment_q90)
+    mention_z = robust_zscore(mention_log)
+    source_z = robust_zscore(source_log)
+    sent_z = robust_zscore(sent_abs)
+    interaction = ((out["mention_count"] > 0) & (out["source_diversity"] > 0)).astype(float)
 
-        score += 14 * mention_norm
-        score += 9 * diversity_norm
-        score += 7 * sentiment_norm
-        if row["filing_flag"]:
-            score += 18
+    raw_info = (0.40 * mention_z) + (0.25 * source_z) + (0.20 * sent_z) + (0.20 * interaction) + (0.35 * filing_num)
+    out["raw_info_flow"] = raw_info
+    out["info_flow_score"] = normalized_score_from_raw(raw_info).round(1)
 
-        if row["mention_count"] >= mention_q90 and row["source_diversity"] >= diversity_q90:
-            score += 4
-
-        adjusted.append(clamp_0_100(score))
-
-    out["activity_score"] = adjusted
+    market_score = pd.to_numeric(out.get("market_activity_score", 50.0), errors="coerce").fillna(50.0)
+    info_score = pd.to_numeric(out["info_flow_score"], errors="coerce").fillna(50.0)
+    out["activity_score"] = (0.65 * market_score + 0.35 * info_score).round().astype(int)
     return out
 
 
@@ -612,26 +724,15 @@ def get_ticker_research_notes(ticker: str, lookback_hours: int, max_items: int =
 
 
 def run_scan(universe: list[str], top_n: int, lookback_hours: int) -> pd.DataFrame:
-    chunk_size = 80
+    chunk_size = 30
     parts: list[pd.DataFrame] = []
 
     for i in range(0, len(universe), chunk_size):
         chunk = universe[i : i + chunk_size]
-        try:
-            market = yf.download(
-                tickers=chunk,
-                period="2mo",
-                interval="1d",
-                group_by="column",
-                auto_adjust=False,
-                progress=False,
-                threads=True,
-            )
-            chunk_metrics = extract_latest_metrics(market, chunk)
-            if not chunk_metrics.empty:
-                parts.append(chunk_metrics)
-        except Exception:
-            continue
+        chunk_metrics = _download_yahoo_daily(chunk, retries=3)
+        if not chunk_metrics.empty:
+            parts.append(chunk_metrics)
+        time.sleep(0.1)
 
     if not parts:
         raise RuntimeError("No market data returned from provider (possible rate-limit/block).")
@@ -648,6 +749,7 @@ def run_scan(universe: list[str], top_n: int, lookback_hours: int) -> pd.DataFra
             one = fetch_single_ticker_metric(t)
             if not one.empty:
                 retry_parts.append(one)
+            time.sleep(0.05)
         if retry_parts:
             retry_df = pd.concat(retry_parts, ignore_index=True)
             metrics = (
@@ -659,7 +761,7 @@ def run_scan(universe: list[str], top_n: int, lookback_hours: int) -> pd.DataFra
         missing = sorted(set(universe) - found)
 
     scored = score_base_metrics(metrics)
-    candidate_pool = scored.sort_values("activity_score", ascending=False).head(max(top_n * 6, 80))
+    candidate_pool = scored.sort_values("market_activity_score", ascending=False).head(max(top_n * 6, 80))
 
     news_features = fetch_news_features(candidate_pool["ticker"].tolist(), lookback_hours=lookback_hours)
     rescored = apply_news_adjustments(scored, news_features)
@@ -754,6 +856,8 @@ def main() -> None:
                         {
                             "ticker": r["ticker"],
                             "activity_score": int(r["activity_score"]),
+                            "market_activity_score": float(r.get("market_activity_score", 50.0)),
+                            "info_flow_score": float(r.get("info_flow_score", 50.0)),
                             "entry_price": float(r["price"]),
                             "selection_reason": r["selection_reason"],
                         }
@@ -769,7 +873,8 @@ def main() -> None:
 
     selected_ticker_for_notes = ""
     if st.session_state["last_ranked"] is not None:
-        ranked = st.session_state["last_ranked"]
+        ranked = ensure_score_columns(st.session_state["last_ranked"])
+        st.session_state["last_ranked"] = ranked
         top_n = int(st.session_state["last_top_n"])
         universe_size = int(st.session_state["last_universe_size"])
         run_at = st.session_state["last_run_at"]
@@ -794,6 +899,8 @@ def main() -> None:
                     [
                         "ticker",
                         "activity_score",
+                        "market_activity_score",
+                        "info_flow_score",
                         "price_move_pct",
                         "volume_ratio",
                         "mention_count",
@@ -813,6 +920,13 @@ def main() -> None:
             avg_move = float(top_df["price_move_pct"].mean())
             st.metric("Avg top score", f"{avg_score:.1f}")
             st.metric("Avg top move", f"{avg_move:+.2f}%")
+        with st.expander("Score Components (Top Picks)"):
+            st.dataframe(
+                top_df[["ticker", "market_activity_score", "info_flow_score", "activity_score"]],
+                use_container_width=True,
+                hide_index=True,
+                height="content",
+            )
 
         st.subheader("Ticker Lookup")
         ticker_query = st.text_input(
@@ -828,10 +942,12 @@ def main() -> None:
         if selected_ticker:
             from_last_scan = ranked[ranked["ticker"] == selected_ticker]
             if not from_last_scan.empty:
-                selected_row = from_last_scan.head(1).copy()
+                selected_row = ensure_score_columns(from_last_scan.head(1).copy())
             else:
                 with st.spinner(f"Fetching {selected_ticker} activity..."):
-                    selected_row = get_single_ticker_activity(selected_ticker, lookback_hours=lookback_hours)
+                    selected_row = ensure_score_columns(
+                        get_single_ticker_activity(selected_ticker, lookback_hours=lookback_hours)
+                    )
 
         if not selected_ticker:
             st.info("Enter a ticker symbol to view activity score and details.")
@@ -841,6 +957,8 @@ def main() -> None:
             summary_cols = [
                 "ticker",
                 "activity_score",
+                "market_activity_score",
+                "info_flow_score",
                 "price_move_pct",
                 "volume_ratio",
                 "mention_count",
