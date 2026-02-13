@@ -125,6 +125,24 @@ SOURCE_CREDIBILITY_WEIGHT = {
     "Other": 50,
     "WSJ": 50,
 }
+EMERGING_BUZZ_MAX_TICKERS = 25
+EMERGING_KEYWORDS = {
+    "deal",
+    "acquisition",
+    "acquire",
+    "merger",
+    "buyout",
+    "partnership",
+    "guidance",
+    "earnings",
+    "downgrade",
+    "upgrade",
+    "sec filing",
+    "insider",
+    "lawsuit",
+    "probe",
+    "contract",
+}
 
 # Tracks CIKs fetched in this process so throttle is only applied for first network fetch.
 SEC_FETCHED_CIKS: set[str] = set()
@@ -913,17 +931,36 @@ def get_ticker_detail_snapshot(ticker: str, range_key: str) -> dict[str, Any]:
     period, interval = range_to_period_interval.get(range_key, ("3mo", "1d"))
 
     tk = yf.Ticker(ticker)
-    hist = yf.download(
-        tickers=ticker,
-        period=period,
-        interval=interval,
-        group_by="column",
-        auto_adjust=False,
-        prepost=(range_key == "1D"),
-        progress=False,
-        threads=True,
-    )
+    def _download_hist(p: str, i: str, pre: bool = False) -> pd.DataFrame:
+        try:
+            df = yf.download(
+                tickers=ticker,
+                period=p,
+                interval=i,
+                group_by="column",
+                auto_adjust=False,
+                prepost=pre,
+                progress=False,
+                threads=True,
+            )
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception:
+            pass
+        try:
+            df2 = tk.history(period=p, interval=i, prepost=pre, auto_adjust=False)
+            if isinstance(df2, pd.DataFrame) and not df2.empty:
+                return df2
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+    hist = _download_hist(period, interval, pre=(range_key == "1D"))
     close_series = hist["Close"].dropna() if "Close" in hist.columns else pd.Series(dtype=float)
+    # Fallback to daily chart when intraday/provider path is temporarily empty.
+    if close_series.empty and range_key in {"1D", "5D", "1M"}:
+        hist = _download_hist("3mo", "1d", pre=False)
+        close_series = hist["Close"].dropna() if "Close" in hist.columns else pd.Series(dtype=float)
     if close_series.empty:
         return {
             "chart": pd.DataFrame(),
@@ -941,15 +978,7 @@ def get_ticker_detail_snapshot(ticker: str, range_key: str) -> dict[str, Any]:
     price_value = float(close_series.iloc[-1])
     prev_close = None
 
-    daily = yf.download(
-        tickers=ticker,
-        period="5d",
-        interval="1d",
-        group_by="column",
-        auto_adjust=False,
-        progress=False,
-        threads=True,
-    )
+    daily = _download_hist("5d", "1d", pre=False)
     daily_close = daily["Close"].dropna() if "Close" in daily.columns else pd.Series(dtype=float)
     if len(daily_close) >= 2:
         prev_close = float(daily_close.iloc[-2])
@@ -1568,6 +1597,189 @@ def get_latest_news_bundle(
     return {"ticker": t, "company_name": c, "items": ranked}
 
 
+@st.cache_data(ttl=900)
+def _fetch_reddit_mentions_items(
+    ticker: str,
+    company_name: str,
+    lookback_hours: int = 168,
+    max_items: int = 25,
+) -> list[dict[str, Any]]:
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return []
+    c = str(company_name or "").strip()
+    cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
+    query = (
+        f'("{t}" OR "{c}") '
+        "(subreddit:wallstreetbets OR subreddit:stocks OR subreddit:investing)"
+    )
+    url = f"https://www.reddit.com/search.rss?q={quote_plus(query)}&sort=new&t=week"
+    rows = _fetch_rss_metadata(url)
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        title = str(r.get("title") or "").strip()
+        link = str(r.get("link") or "").strip()
+        if not title or not link:
+            continue
+        dt = r.get("published_utc")
+        if isinstance(dt, datetime) and dt < cutoff:
+            continue
+        if not _filter_matches_ticker(f"{title} {r.get('description', '')}", t, c):
+            continue
+        out.append(
+            {
+                "headline": title,
+                "url": link,
+                "published_at": dt.isoformat() if isinstance(dt, datetime) else "",
+                "source": "Reddit",
+            }
+        )
+    out.sort(key=lambda x: str(x.get("published_at", "")), reverse=True)
+    return out[:max_items]
+
+
+def _parse_iso_utc(value: str) -> datetime | None:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        else:
+            dt = dt.astimezone(UTC)
+        return dt
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=900)
+def get_emerging_buzz_table(
+    ranked_rows: list[dict[str, Any]],
+    company_rows: list[dict[str, Any]],
+    lookback_hours: int = 168,
+    max_tickers: int = EMERGING_BUZZ_MAX_TICKERS,
+) -> pd.DataFrame:
+    if not ranked_rows:
+        return pd.DataFrame()
+    ranked = pd.DataFrame(ranked_rows)
+    if ranked.empty or "ticker" not in ranked.columns:
+        return pd.DataFrame()
+    companies = pd.DataFrame(company_rows) if company_rows else pd.DataFrame(columns=["ticker", "company_name"])
+    name_map = {
+        str(r.get("ticker", "")).upper(): str(r.get("company_name", "")).strip()
+        for _, r in companies.iterrows()
+    }
+
+    ranked["ticker"] = ranked["ticker"].astype(str).str.upper()
+    news_active = ranked[
+        (pd.to_numeric(ranked.get("mention_count", 0), errors="coerce").fillna(0) > 0)
+        | (pd.to_numeric(ranked.get("source_diversity", 0), errors="coerce").fillna(0) > 0)
+    ]["ticker"].tolist()
+    movers = ranked.sort_values(["activity_score", "market_activity_score"], ascending=[False, False])["ticker"].tolist()
+    candidates: list[str] = []
+    for t in news_active + movers:
+        if t not in candidates:
+            candidates.append(t)
+        if len(candidates) >= max(5, int(max_tickers)):
+            break
+
+    now_utc = datetime.now(UTC)
+    rows: list[dict[str, Any]] = []
+    for t in candidates:
+        company = name_map.get(t, "")
+        try:
+            news_items = _fetch_google_news_items(t, company, lookback_hours=lookback_hours)
+        except Exception:
+            news_items = []
+        try:
+            reddit_items = _fetch_reddit_mentions_items(t, company, lookback_hours=lookback_hours)
+        except Exception:
+            reddit_items = []
+
+        news_times = [_parse_iso_utc(str(n.get("published_at", ""))) for n in news_items]
+        news_times = [dt for dt in news_times if dt is not None]
+        news_7d = len(news_items)
+        news_24h = sum(1 for dt in news_times if dt >= now_utc - timedelta(hours=24))
+        older_news = max(0, news_7d - news_24h)
+        baseline_per_day = older_news / 6.0 if older_news > 0 else 0.0
+        velocity = (news_24h + 1.0) / (baseline_per_day + 1.0)
+
+        reddit_times = [_parse_iso_utc(str(r.get("published_at", ""))) for r in reddit_items]
+        reddit_times = [dt for dt in reddit_times if dt is not None]
+        reddit_7d = len(reddit_items)
+        reddit_24h = sum(1 for dt in reddit_times if dt >= now_utc - timedelta(hours=24))
+
+        headlines = " || ".join([str(n.get("headline", "")).lower() for n in news_items[:15]])
+        keyword_hits = sum(1 for kw in EMERGING_KEYWORDS if kw in headlines)
+        sentiment_sum = sum(_headline_sentiment(str(n.get("headline", ""))) for n in news_items[:15])
+        x_mentions = sum(
+            1
+            for n in news_items
+            if _domain_from_url(str(n.get("url", ""))) in {"x.com", "twitter.com"}
+        )
+
+        rank_row = ranked[ranked["ticker"] == t].head(1)
+        mention_count = int(pd.to_numeric(rank_row.get("mention_count", pd.Series([0])), errors="coerce").fillna(0).iloc[0]) if not rank_row.empty else 0
+        source_diversity = int(pd.to_numeric(rank_row.get("source_diversity", pd.Series([0])), errors="coerce").fillna(0).iloc[0]) if not rank_row.empty else 0
+        filing_flag = bool(rank_row.get("filing_flag", pd.Series([False])).iloc[0]) if not rank_row.empty else False
+        price_move = float(pd.to_numeric(rank_row.get("price_move_pct", pd.Series([0.0])), errors="coerce").fillna(0.0).iloc[0]) if not rank_row.empty else 0.0
+
+        buzz_score = (
+            25.0 * min(1.0, news_24h / 5.0)
+            + 18.0 * min(1.0, news_7d / 12.0)
+            + 18.0 * min(1.0, velocity / 2.0)
+            + 18.0 * min(1.0, reddit_7d / 8.0)
+            + 8.0 * min(1.0, reddit_24h / 3.0)
+            + 8.0 * min(1.0, keyword_hits / 3.0)
+            + 3.0 * min(1.0, max(mention_count, source_diversity) / 4.0)
+            + (2.0 if filing_flag else 0.0)
+        )
+        buzz_score = int(max(0, min(100, round(buzz_score))))
+
+        drivers: list[str] = []
+        if velocity >= 1.3:
+            drivers.append(f"news velocity {velocity:.2f}x")
+        if reddit_7d > 0:
+            drivers.append(f"reddit {reddit_7d} mentions")
+        if keyword_hits > 0:
+            drivers.append("deal/catalyst headlines")
+        if x_mentions > 0:
+            drivers.append(f"x/twitter refs {x_mentions}")
+        if filing_flag:
+            drivers.append("recent SEC filing")
+        if not drivers:
+            drivers.append("steady mention flow")
+
+        direction_score = sentiment_sum + (1.5 if price_move > 0 else (-1.5 if price_move < 0 else 0.0))
+        if direction_score >= 1.5:
+            buzz_direction = "bullish"
+        elif direction_score <= -1.5:
+            buzz_direction = "bearish"
+        else:
+            buzz_direction = "mixed"
+
+        rows.append(
+            {
+                "ticker": t,
+                "company_name": company or t,
+                "buzz_score": buzz_score,
+                "buzz_direction": buzz_direction,
+                "news_24h": int(news_24h),
+                "news_7d": int(news_7d),
+                "reddit_24h": int(reddit_24h),
+                "reddit_7d": int(reddit_7d),
+                "mention_velocity": round(float(velocity), 2),
+                "drivers": ", ".join(drivers[:3]),
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["buzz_score", "news_24h", "reddit_24h", "ticker"], ascending=[False, False, False, True]).reset_index(drop=True)
+
+
 def _score_external_news_item(
     title: str,
     source: str,
@@ -1822,6 +2034,14 @@ def main() -> None:
         st.session_state["last_table_selected_ticker"] = ""
     if "last_sec_queried_tickers" not in st.session_state:
         st.session_state["last_sec_queried_tickers"] = []
+    if "selection_lock_source" not in st.session_state:
+        st.session_state["selection_lock_source"] = ""
+    if "force_all_stocks_ticker" not in st.session_state:
+        st.session_state["force_all_stocks_ticker"] = ""
+    if "top_picks_table_nonce" not in st.session_state:
+        st.session_state["top_picks_table_nonce"] = 0
+    if "emerging_buzz_table_nonce" not in st.session_state:
+        st.session_state["emerging_buzz_table_nonce"] = 0
 
     with st.sidebar:
         st.subheader("Scan Controls")
@@ -1861,6 +2081,10 @@ def main() -> None:
                 st.session_state["last_run_at"] = now
                 st.session_state["last_missing_tickers"] = ranked.attrs.get("missing_tickers", [])
                 st.session_state["last_sec_queried_tickers"] = ranked.attrs.get("sec_queried_tickers", [])
+                st.session_state["selection_lock_source"] = ""
+                st.session_state["force_all_stocks_ticker"] = ""
+                st.session_state["top_picks_table_nonce"] += 1
+                st.session_state["emerging_buzz_table_nonce"] += 1
 
                 run_record = {
                     "run_at_utc": now,
@@ -1928,6 +2152,7 @@ def main() -> None:
             key="all_stocks_search",
             placeholder="e.g., NVDA or NVIDIA",
         ).strip().upper()
+        universe_df = pd.DataFrame(columns=["ticker", "company_name"])
         try:
             universe_df = get_sp500_universe_df()
             score_cols = ranked[
@@ -1969,6 +2194,9 @@ def main() -> None:
                 all_stocks = all_stocks[all_stocks["filing_flag"] == True]
 
             all_stocks = rank_all_stocks_matches(all_stocks, all_stocks_query)
+            forced_ticker = str(st.session_state.get("force_all_stocks_ticker", "")).strip().upper()
+            if forced_ticker:
+                all_stocks = all_stocks[all_stocks["ticker"].astype(str).str.upper() == forced_ticker]
 
             display_cols = [
                 "company_name",
@@ -2019,12 +2247,16 @@ def main() -> None:
                     st.session_state["selected_ticker"] = picked_ticker
                     st.session_state["pending_all_stocks_search"] = picked_ticker
                     st.session_state["last_table_selected_ticker"] = picked_ticker
+                    st.session_state["selection_lock_source"] = ""
+                    st.session_state["force_all_stocks_ticker"] = ""
                     st.rerun()
             else:
                 if current_selected:
                     st.session_state["selected_ticker"] = ""
                     st.session_state["last_table_selected_ticker"] = ""
                     st.session_state["pending_all_stocks_search"] = "__CLEAR__"
+                    st.session_state["selection_lock_source"] = ""
+                    st.session_state["force_all_stocks_ticker"] = ""
                     st.rerun()
 
             if st.session_state.get("selected_ticker"):
@@ -2049,40 +2281,44 @@ def main() -> None:
                 "selection_reason",
             ]
             top_picks_view = top_df[top_pick_cols].reset_index(drop=True)
-            try:
-                st.dataframe(
-                    top_picks_view,
-                    use_container_width=True,
-                    hide_index=True,
-                    selection_mode="single-row",
-                    on_select="rerun",
-                    key="top_picks_table",
-                )
-                top_rows: list[int] = []
-                top_state = st.session_state.get("top_picks_table", {})
-                if isinstance(top_state, dict):
-                    sel = top_state.get("selection", {})
-                    if isinstance(sel, dict):
-                        top_rows = sel.get("rows", []) or []
-                if top_rows:
-                    idx = int(top_rows[0])
-                    if 0 <= idx < len(top_picks_view):
-                        picked_ticker = str(top_picks_view.iloc[idx]["ticker"]).upper()
-                        current_selected = str(st.session_state.get("selected_ticker", "")).upper()
-                        current_all_search = str(st.session_state.get("all_stocks_search", "")).strip().upper()
-                        # Always sync All Stocks search + selected ticker from Top Picks selection.
-                        # This keeps table checkbox state and ticker details consistent.
-                        if (picked_ticker != current_selected) or (current_all_search != picked_ticker):
-                            st.session_state["selected_ticker"] = picked_ticker
-                            st.session_state["last_table_selected_ticker"] = picked_ticker
-                            st.session_state["pending_all_stocks_search"] = picked_ticker
-                            st.rerun()
-            except TypeError:
-                st.dataframe(
-                    top_picks_view,
-                    use_container_width=True,
-                    hide_index=True,
-                )
+            top_table_key = f"top_picks_table_{int(st.session_state.get('top_picks_table_nonce', 0))}"
+            st.dataframe(
+                top_picks_view,
+                use_container_width=True,
+                hide_index=True,
+                height=320,
+                selection_mode="single-row",
+                on_select="rerun",
+                key=top_table_key,
+            )
+            top_rows: list[int] = []
+            top_state = st.session_state.get(top_table_key, {})
+            if isinstance(top_state, dict):
+                sel = top_state.get("selection", {})
+                if isinstance(sel, dict):
+                    top_rows = sel.get("rows", []) or []
+            if top_rows:
+                idx = int(top_rows[0])
+                if 0 <= idx < len(top_picks_view):
+                    picked_ticker = str(top_picks_view.iloc[idx]["ticker"]).upper()
+                    current_selected = str(st.session_state.get("selected_ticker", "")).upper()
+                    current_all_search = str(st.session_state.get("all_stocks_search", "")).strip().upper()
+                    current_forced = str(st.session_state.get("force_all_stocks_ticker", "")).strip().upper()
+                    current_lock = str(st.session_state.get("selection_lock_source", "")).strip().lower()
+                    if (
+                        (picked_ticker != current_selected)
+                        or (current_all_search != picked_ticker)
+                        or (current_forced != picked_ticker)
+                        or (current_lock != "top")
+                    ):
+                        st.session_state["selected_ticker"] = picked_ticker
+                        st.session_state["last_table_selected_ticker"] = picked_ticker
+                        st.session_state["pending_all_stocks_search"] = picked_ticker
+                        st.session_state["selection_lock_source"] = "top"
+                        st.session_state["force_all_stocks_ticker"] = picked_ticker
+                        # Reset opposite table selection state so only one visible selection remains.
+                        st.session_state["emerging_buzz_table_nonce"] += 1
+                        st.rerun()
 
         with col2:
             st.subheader("Run Snapshot")
@@ -2098,6 +2334,105 @@ def main() -> None:
                 hide_index=True,
                 height="content",
             )
+        if st.button("Clear active table selection", key="clear_active_table_selection_btn"):
+            st.session_state["selected_ticker"] = ""
+            st.session_state["last_table_selected_ticker"] = ""
+            st.session_state["pending_all_stocks_search"] = "__CLEAR__"
+            st.session_state["selection_lock_source"] = ""
+            st.session_state["force_all_stocks_ticker"] = ""
+            st.session_state["top_picks_table_nonce"] += 1
+            st.session_state["emerging_buzz_table_nonce"] += 1
+            st.rerun()
+
+        st.subheader("Emerging Buzz (Last 7 Days)")
+        st.caption(
+            "Tickers gaining momentum from accelerating news flow, deal/catalyst headlines, "
+            "and Reddit discussions (WallStreetBets/stocks/investing)."
+        )
+        ranked_cols_for_buzz = [
+            "ticker",
+            "activity_score",
+            "market_activity_score",
+            "price_move_pct",
+            "mention_count",
+            "source_diversity",
+            "filing_flag",
+        ]
+        ranked_rows_for_buzz = (
+            ranked[ranked_cols_for_buzz].to_dict(orient="records")
+            if all(col in ranked.columns for col in ranked_cols_for_buzz)
+            else ranked.to_dict(orient="records")
+        )
+        company_rows_for_buzz = universe_df[["ticker", "company_name"]].to_dict(orient="records")
+        with st.spinner("Scanning momentum chatter and weekly headlines..."):
+            buzz_df = get_emerging_buzz_table(
+                ranked_rows=ranked_rows_for_buzz,
+                company_rows=company_rows_for_buzz,
+                lookback_hours=168,
+                max_tickers=EMERGING_BUZZ_MAX_TICKERS,
+            )
+        if buzz_df.empty:
+            st.caption("No emerging buzz candidates found in this run.")
+        else:
+            buzz_view = buzz_df.copy()
+            buzz_view["buzz_indicator"] = buzz_view["buzz_direction"].map(
+                {
+                    "bullish": "🟢 bullish",
+                    "bearish": "🔴 bearish",
+                    "mixed": "🟡 mixed",
+                }
+            ).fillna("🟡 mixed")
+            ordered_cols = [
+                "ticker",
+                "company_name",
+                "buzz_score",
+                "buzz_indicator",
+                "news_24h",
+                "news_7d",
+                "reddit_24h",
+                "reddit_7d",
+                "mention_velocity",
+                "drivers",
+            ]
+            buzz_view = buzz_view[[c for c in ordered_cols if c in buzz_view.columns]]
+            buzz_table_key = f"emerging_buzz_table_{int(st.session_state.get('emerging_buzz_table_nonce', 0))}"
+            st.dataframe(
+                buzz_view,
+                use_container_width=True,
+                hide_index=True,
+                height=320,
+                selection_mode="single-row",
+                on_select="rerun",
+                key=buzz_table_key,
+            )
+            buzz_rows: list[int] = []
+            buzz_state = st.session_state.get(buzz_table_key, {})
+            if isinstance(buzz_state, dict):
+                sel = buzz_state.get("selection", {})
+                if isinstance(sel, dict):
+                    buzz_rows = sel.get("rows", []) or []
+            if buzz_rows:
+                idx = int(buzz_rows[0])
+                if 0 <= idx < len(buzz_view):
+                    picked_ticker = str(buzz_view.iloc[idx]["ticker"]).upper()
+                    current_selected = str(st.session_state.get("selected_ticker", "")).upper()
+                    current_all_search = str(st.session_state.get("all_stocks_search", "")).strip().upper()
+                    current_forced = str(st.session_state.get("force_all_stocks_ticker", "")).strip().upper()
+                    current_lock = str(st.session_state.get("selection_lock_source", "")).strip().lower()
+                    if (
+                        (picked_ticker != current_selected)
+                        or (current_all_search != picked_ticker)
+                        or (current_forced != picked_ticker)
+                        or (current_lock != "emerging")
+                    ):
+                        st.session_state["selected_ticker"] = picked_ticker
+                        st.session_state["last_table_selected_ticker"] = picked_ticker
+                        st.session_state["pending_all_stocks_search"] = picked_ticker
+                        st.session_state["selection_lock_source"] = "emerging"
+                        st.session_state["force_all_stocks_ticker"] = picked_ticker
+                        # Reset opposite table selection state so only one visible selection remains.
+                        st.session_state["top_picks_table_nonce"] += 1
+                        st.rerun()
 
         st.subheader("Ticker Lookup")
         selected_ticker = str(st.session_state.get("selected_ticker", "")).upper()
