@@ -3,14 +3,19 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from difflib import get_close_matches
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
+from html import unescape
 from io import StringIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote_plus, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -61,6 +66,65 @@ SEC_LOOKBACK_DAYS_DEFAULT = 2
 SEC_USER_AGENT = "SignalWeave/1.0 (contact: your-email@example.com)"
 SEC_MAX_TICKERS_PER_SCAN = 75
 SEC_REQUEST_THROTTLE_SEC = 0.12
+NEWS_LOOKBACK_DAYS_DEFAULT = 7
+HTTP_TIMEOUT_SEC = 8
+NEWS_SOURCE_DOMAINS = [
+    "wsj.com",
+    "cnbc.com",
+    "reuters.com",
+    "bloomberg.com",
+    "marketwatch.com",
+    "barrons.com",
+    "finance.yahoo.com",
+]
+NEWS_SOURCE_PRIORITY = {
+    "wsj": 30,
+    "cnbc": 28,
+    "reuters": 30,
+    "bloomberg": 30,
+    "marketwatch": 24,
+    "barrons": 26,
+    "yahoo": 20,
+}
+NEWS_IMPORTANCE_KEYWORDS = {
+    "earnings",
+    "guidance",
+    "forecast",
+    "acquisition",
+    "merger",
+    "buyback",
+    "downgrade",
+    "upgrade",
+    "sec",
+    "probe",
+    "lawsuit",
+    "fda",
+    "approval",
+    "bankruptcy",
+    "layoffs",
+    "dividend",
+    "ceo",
+    "cfo",
+}
+PAYWALLED_DOMAINS = {"wsj.com", "ft.com", "bloomberg.com", "barrons.com"}
+IR_RSS_FEEDS: dict[str, str] = {
+    # Example IR RSS feeds (optional; skipped gracefully if unavailable).
+    "AAPL": "https://investor.apple.com/rss/news-releases.xml",
+    "MSFT": "https://www.microsoft.com/en-us/Investor/RSS/RSSDetails.aspx?Category=PressRelease",
+    "NVDA": "https://investor.nvidia.com/rss/PressRelease.aspx",
+    "AMZN": "https://www.aboutamazon.com/news/rss.xml",
+    "GOOGL": "https://abc.xyz/investor/news/rss",
+}
+SOURCE_CREDIBILITY_WEIGHT = {
+    "SEC": 100,
+    "CompanyIR": 90,
+    "Reuters": 80,
+    "AP": 80,
+    "CNBC": 70,
+    "GoogleNewsRSS": 60,
+    "Other": 50,
+    "WSJ": 50,
+}
 
 # Tracks CIKs fetched in this process so throttle is only applied for first network fetch.
 SEC_FETCHED_CIKS: set[str] = set()
@@ -486,6 +550,9 @@ def get_recent_sec_filings_for_ticker(ticker: str, lookback_days: int = SEC_LOOK
 
     if not selected:
         return _default_sec_features()
+
+    # Ensure deterministic newest-first ordering by filing date.
+    selected.sort(key=lambda x: str(x.get("date", "")), reverse=True)
 
     filing_types: list[str] = []
     for s in selected:
@@ -1060,6 +1127,568 @@ def get_ticker_news_items(ticker: str, lookback_hours: int, max_items: int = 15)
     return items[:max_items]
 
 
+def _domain_from_url(url: str) -> str:
+    try:
+        host = (urlparse(url).netloc or "").lower()
+    except Exception:
+        host = ""
+    return host.replace("www.", "")
+
+
+def _is_paywalled_domain(domain: str) -> bool:
+    d = (domain or "").lower()
+    return any(d == pdm or d.endswith(f".{pdm}") for pdm in PAYWALLED_DOMAINS)
+
+
+def _classify_source_from_domain(domain: str, default_source: str = "GoogleNewsRSS") -> str:
+    d = (domain or "").lower()
+    if "wsj.com" in d:
+        return "WSJ"
+    if "cnbc.com" in d:
+        return "CNBC"
+    if "reuters.com" in d:
+        return "Reuters"
+    if "apnews.com" in d or d.endswith("ap.org"):
+        return "AP"
+    return default_source
+
+
+def _parse_rss_datetime(value: str) -> datetime | None:
+    v = str(value or "").strip()
+    if not v:
+        return None
+    try:
+        dt = parsedate_to_datetime(v)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        else:
+            dt = dt.astimezone(UTC)
+        return dt
+    except Exception:
+        return None
+
+
+def _strip_html(text: str) -> str:
+    raw = str(text or "")
+    if not raw:
+        return ""
+    no_tags = re.sub(r"<[^>]+>", " ", raw)
+    collapsed = re.sub(r"\s+", " ", unescape(no_tags)).strip()
+    return collapsed
+
+
+def _extract_first_href(text: str) -> str:
+    raw = str(text or "")
+    if not raw:
+        return ""
+    m = re.search(r'href=[\'"]([^\'"]+)[\'"]', raw, flags=re.IGNORECASE)
+    if not m:
+        return ""
+    return m.group(1).strip()
+
+
+def _filter_matches_ticker(text: str, ticker: str, company_name: str) -> bool:
+    low = (text or "").lower()
+    t = str(ticker or "").strip().lower()
+    c = str(company_name or "").strip().lower()
+    if t and t in low:
+        return True
+    if c and c in low:
+        return True
+    if c:
+        first = c.split()[0]
+        if len(first) >= 3 and first in low:
+            return True
+    return False
+
+
+@st.cache_data(ttl=900)
+def _fetch_rss_metadata(url: str) -> list[dict[str, Any]]:
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml, application/xml"})
+    try:
+        with urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
+            xml_text = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return []
+
+    out: list[dict[str, Any]] = []
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        raw_desc = (item.findtext("description") or "").strip()
+        desc = _strip_html(raw_desc)
+        desc_first_link = _extract_first_href(raw_desc)
+        pub_raw = (item.findtext("pubDate") or item.findtext("published") or item.findtext("updated") or "").strip()
+        src = (item.findtext("source") or "").strip()
+        pub_dt = _parse_rss_datetime(pub_raw)
+        out.append(
+            {
+                "title": title,
+                "link": link,
+                "description": desc,
+                "description_first_link": desc_first_link,
+                "published_utc": pub_dt,
+                "source_hint": src,
+            }
+        )
+    return out
+
+
+@st.cache_data(ttl=900)
+def _fetch_company_ir_news(ticker: str, company_name: str, lookback_hours: int) -> list[dict[str, Any]]:
+    t = str(ticker or "").strip().upper()
+    feed_url = IR_RSS_FEEDS.get(t)
+    if not feed_url:
+        return []
+    cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
+    rows = _fetch_rss_metadata(feed_url)
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        dt = r.get("published_utc")
+        if isinstance(dt, datetime) and dt < cutoff:
+            continue
+        title = str(r.get("title") or "").strip()
+        link = str(r.get("link") or "").strip()
+        if not title or not link:
+            continue
+        snippet = str(r.get("description") or "").strip()
+        out.append(
+            {
+                "source": "CompanyIR",
+                "headline": title,
+                "snippet": snippet,
+                "published_at": dt.isoformat() if isinstance(dt, datetime) else "",
+                "url": link,
+                "paywalled_suspected": False,
+                "content_fetched": True,
+                "fetch_reason": "ir_rss",
+            }
+        )
+    return out
+
+
+@st.cache_data(ttl=900)
+def _fetch_google_news_items(
+    ticker: str,
+    company_name: str,
+    lookback_hours: int,
+    query_sites: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return []
+    c = str(company_name or "").strip()
+    cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
+
+    terms = [f'"{t}"', f'"{t} stock"']
+    if c:
+        terms.insert(0, f'"{c}"')
+    query = " OR ".join(terms)
+    if query_sites:
+        site_part = " OR ".join([f"site:{s}" for s in query_sites])
+        query = f"({query}) ({site_part})"
+    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
+    rows = _fetch_rss_metadata(url)
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        title = str(r.get("title") or "").strip()
+        link = str(r.get("description_first_link") or r.get("link") or "").strip()
+        if not title or not link:
+            continue
+        dt = r.get("published_utc")
+        if isinstance(dt, datetime) and dt < cutoff:
+            continue
+        domain = _domain_from_url(link)
+        source = _classify_source_from_domain(domain, default_source="GoogleNewsRSS")
+        paywalled = _is_paywalled_domain(domain) or (source == "WSJ")
+        desc = str(r.get("description") or "").strip()
+        snippet = desc if (desc and not paywalled) else ""
+        out.append(
+            {
+                "source": source,
+                "headline": title,
+                "snippet": snippet,
+                "published_at": dt.isoformat() if isinstance(dt, datetime) else "",
+                "url": link,
+                "paywalled_suspected": bool(paywalled),
+                "content_fetched": False,
+                "fetch_reason": "paywall_or_access_restricted" if paywalled else "rss_metadata",
+            }
+        )
+    return out
+
+
+@st.cache_data(ttl=900)
+def _fetch_cnbc_rss_items(ticker: str, company_name: str, lookback_hours: int) -> list[dict[str, Any]]:
+    # Public CNBC RSS metadata feed (no article body fetch).
+    feed_url = "https://www.cnbc.com/id/100003114/device/rss/rss.html"
+    cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
+    rows = _fetch_rss_metadata(feed_url)
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        title = str(r.get("title") or "").strip()
+        link = str(r.get("link") or "").strip()
+        desc = str(r.get("description") or "").strip()
+        if not title or not link:
+            continue
+        dt = r.get("published_utc")
+        if isinstance(dt, datetime) and dt < cutoff:
+            continue
+        if not _filter_matches_ticker(f"{title} {desc}", ticker, company_name):
+            continue
+        out.append(
+            {
+                "source": "CNBC",
+                "headline": title,
+                "snippet": desc,
+                "published_at": dt.isoformat() if isinstance(dt, datetime) else "",
+                "url": link,
+                "paywalled_suspected": False,
+                "content_fetched": False,
+                "fetch_reason": "rss_metadata",
+            }
+        )
+    return out
+
+
+@st.cache_data(ttl=900)
+def _fetch_wsj_rss_items(ticker: str, company_name: str, lookback_hours: int) -> list[dict[str, Any]]:
+    # WSJ metadata only from RSS; no page fetches.
+    feed_url = "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"
+    cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
+    rows = _fetch_rss_metadata(feed_url)
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        title = str(r.get("title") or "").strip()
+        link = str(r.get("link") or "").strip()
+        if not title or not link:
+            continue
+        dt = r.get("published_utc")
+        if isinstance(dt, datetime) and dt < cutoff:
+            continue
+        desc = str(r.get("description") or "").strip()
+        if not _filter_matches_ticker(f"{title} {desc}", ticker, company_name):
+            continue
+        out.append(
+            {
+                "source": "WSJ",
+                "headline": title,
+                "snippet": "",
+                "published_at": dt.isoformat() if isinstance(dt, datetime) else "",
+                "url": link,
+                "paywalled_suspected": True,
+                "content_fetched": False,
+                "fetch_reason": "paywall_or_access_restricted",
+            }
+        )
+    return out
+
+
+@st.cache_data(ttl=600)
+def _fetch_yahoo_metadata_news(ticker: str, lookback_hours: int) -> list[dict[str, Any]]:
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return []
+    cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
+    try:
+        news_items = yf.Ticker(t).news or []
+    except Exception:
+        news_items = []
+    out: list[dict[str, Any]] = []
+    for n in news_items:
+        ts = n.get("providerPublishTime")
+        if ts is None:
+            continue
+        try:
+            dt = datetime.fromtimestamp(ts, tz=UTC)
+        except Exception:
+            continue
+        if dt < cutoff:
+            continue
+        title = str(n.get("title") or "").strip()
+        url = str(n.get("link") or "").strip()
+        if not title or not url:
+            continue
+        publisher = str(n.get("publisher") or n.get("provider") or "Other").strip()
+        domain = _domain_from_url(url)
+        source = _classify_source_from_domain(domain, default_source="Other")
+        if source == "Other" and publisher:
+            if "reuters" in publisher.lower():
+                source = "Reuters"
+            elif publisher.lower() in {"ap", "associated press"}:
+                source = "AP"
+            elif "cnbc" in publisher.lower():
+                source = "CNBC"
+            elif "wsj" in publisher.lower() or "wall street journal" in publisher.lower():
+                source = "WSJ"
+        paywalled = _is_paywalled_domain(domain) or source == "WSJ"
+        snippet = str(n.get("summary") or n.get("snippet") or "").strip()
+        if paywalled:
+            snippet = ""
+        out.append(
+            {
+                "source": source,
+                "headline": title,
+                "snippet": snippet,
+                "published_at": dt.isoformat(),
+                "url": url,
+                "paywalled_suspected": bool(paywalled),
+                "content_fetched": False,
+                "fetch_reason": "paywall_or_access_restricted" if paywalled else "rss_metadata",
+            }
+        )
+    return out
+
+
+def _sec_filings_to_news_items(ticker: str, lookback_hours: int) -> list[dict[str, Any]]:
+    lookback_days = max(1, int(math.ceil(max(1, lookback_hours) / 24.0)))
+    sec_data = get_recent_sec_filings_for_ticker(ticker, lookback_days=lookback_days)
+    filings = sec_data.get("filings", []) or []
+    out: list[dict[str, Any]] = []
+    for f in filings:
+        form = str(f.get("form") or "").strip()
+        date_str = str(f.get("date") or "").strip()
+        url = str(f.get("index_link") or f.get("link") or "").strip()
+        if not form or not date_str or not url:
+            continue
+        if form == "4":
+            headline = "SEC Filing: Form 4 insider transaction"
+        else:
+            headline = f"SEC Filing: {form} filed"
+        out.append(
+            {
+                "source": "SEC",
+                "headline": headline,
+                "snippet": f"{form} filing date {date_str}",
+                "published_at": f"{date_str}T00:00:00+00:00",
+                "url": url,
+                "paywalled_suspected": False,
+                "content_fetched": True,
+                "fetch_reason": "sec_primary",
+            }
+        )
+    return out
+
+
+def _normalize_news_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source": str(item.get("source") or "Other"),
+        "headline": str(item.get("headline") or "").strip(),
+        "snippet": str(item.get("snippet") or "").strip(),
+        "published_at": str(item.get("published_at") or "").strip(),
+        "url": str(item.get("url") or "").strip(),
+        "paywalled_suspected": bool(item.get("paywalled_suspected", False)),
+        "content_fetched": bool(item.get("content_fetched", False)),
+        "fetch_reason": str(item.get("fetch_reason") or "error"),
+    }
+
+
+def _dedupe_and_rank_news(items: list[dict[str, Any]], max_items: int) -> list[dict[str, Any]]:
+    seen_urls: set[str] = set()
+    seen_keys: set[str] = set()
+    clean: list[dict[str, Any]] = []
+    for raw in items:
+        item = _normalize_news_item(raw)
+        if not item["headline"] or not item["url"]:
+            continue
+        domain = _domain_from_url(item["url"])
+        key = f"{item['headline'].strip().lower()}::{domain}"
+        if item["url"] in seen_urls or key in seen_keys:
+            continue
+        seen_urls.add(item["url"])
+        seen_keys.add(key)
+        clean.append(item)
+
+    def _sort_key(it: dict[str, Any]) -> tuple[float, int]:
+        dt = _parse_rss_datetime(it.get("published_at", ""))
+        if dt is None:
+            try:
+                dt = datetime.fromisoformat(str(it.get("published_at", "")))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=UTC)
+                else:
+                    dt = dt.astimezone(UTC)
+            except Exception:
+                dt = datetime.fromtimestamp(0, tz=UTC)
+        weight = SOURCE_CREDIBILITY_WEIGHT.get(it.get("source", "Other"), SOURCE_CREDIBILITY_WEIGHT["Other"])
+        return (dt.timestamp(), weight)
+
+    clean.sort(key=_sort_key, reverse=True)
+    return clean[: max(1, int(max_items))]
+
+
+def get_latest_news_bundle(
+    ticker: str,
+    company_name: str,
+    lookback_hours: int = 72,
+    max_items: int = 40,
+) -> dict[str, Any]:
+    t = str(ticker or "").strip().upper()
+    c = str(company_name or "").strip()
+    if not t:
+        return {"ticker": "", "company_name": c, "items": []}
+
+    items: list[dict[str, Any]] = []
+    try:
+        items.extend(_sec_filings_to_news_items(t, lookback_hours))
+    except Exception:
+        pass
+    try:
+        items.extend(_fetch_company_ir_news(t, c, lookback_hours))
+    except Exception:
+        pass
+    try:
+        items.extend(_fetch_google_news_items(t, c, lookback_hours))
+    except Exception:
+        pass
+    try:
+        items.extend(_fetch_google_news_items(t, c, lookback_hours, query_sites=("reuters.com", "apnews.com")))
+    except Exception:
+        pass
+    try:
+        items.extend(_fetch_cnbc_rss_items(t, c, lookback_hours))
+    except Exception:
+        pass
+    try:
+        items.extend(_fetch_wsj_rss_items(t, c, lookback_hours))
+    except Exception:
+        pass
+    try:
+        items.extend(_fetch_yahoo_metadata_news(t, lookback_hours))
+    except Exception:
+        pass
+
+    ranked = _dedupe_and_rank_news(items, max_items=max_items)
+    return {"ticker": t, "company_name": c, "items": ranked}
+
+
+def _score_external_news_item(
+    title: str,
+    source: str,
+    published_utc: datetime,
+    ticker: str,
+    company_name: str,
+    lookback_days: int,
+) -> int:
+    source_key = source.lower()
+    source_score = 12
+    for k, v in NEWS_SOURCE_PRIORITY.items():
+        if k in source_key:
+            source_score = v
+            break
+
+    age_hours = max(0.0, (datetime.now(UTC) - published_utc).total_seconds() / 3600.0)
+    max_hours = max(24.0, float(lookback_days) * 24.0)
+    recency_score = max(0.0, 30.0 * (1.0 - min(age_hours / max_hours, 1.0)))
+
+    low_title = title.lower()
+    keyword_hits = sum(1 for kw in NEWS_IMPORTANCE_KEYWORDS if kw in low_title)
+    keyword_score = min(20, keyword_hits * 5)
+    ticker_score = 10 if ticker.lower() in low_title else 0
+    company_score = 0
+    if company_name:
+        first_token = company_name.split()[0].strip().lower()
+        if len(first_token) >= 3 and first_token in low_title:
+            company_score = 6
+
+    return int(max(0, min(100, round(source_score + recency_score + keyword_score + ticker_score + company_score))))
+
+
+@st.cache_data(ttl=900)
+def get_external_ticker_news(
+    ticker: str,
+    company_name: str,
+    lookback_days: int = NEWS_LOOKBACK_DAYS_DEFAULT,
+    max_items: int = 30,
+) -> list[dict[str, Any]]:
+    ticker = str(ticker or "").strip().upper()
+    if not ticker:
+        return []
+
+    company_name = str(company_name or "").strip()
+    query_terms = [f'"{ticker}"']
+    if company_name:
+        query_terms.append(f'"{company_name}"')
+    name_query = " OR ".join(query_terms)
+    sites_query = " OR ".join([f"site:{d}" for d in NEWS_SOURCE_DOMAINS])
+    query = f"({name_query}) ({sites_query})"
+    url = (
+        "https://news.google.com/rss/search?"
+        f"q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
+    )
+
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=15) as resp:
+            xml_text = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+
+    cutoff = datetime.now(UTC) - timedelta(days=lookback_days)
+    out: list[dict[str, Any]] = []
+    seen_links: set[str] = set()
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return []
+
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub_raw = (item.findtext("pubDate") or "").strip()
+        source = (item.findtext("source") or "").strip()
+
+        if not title or not link or not pub_raw:
+            continue
+        if link in seen_links:
+            continue
+
+        try:
+            published_utc = parsedate_to_datetime(pub_raw)
+            if published_utc.tzinfo is None:
+                published_utc = published_utc.replace(tzinfo=UTC)
+            else:
+                published_utc = published_utc.astimezone(UTC)
+        except Exception:
+            continue
+
+        if published_utc < cutoff:
+            continue
+
+        if not source:
+            host = urlparse(link).netloc.lower()
+            source = host.replace("www.", "") if host else "Unknown"
+
+        importance = _score_external_news_item(
+            title=title,
+            source=source,
+            published_utc=published_utc,
+            ticker=ticker,
+            company_name=company_name,
+            lookback_days=lookback_days,
+        )
+        seen_links.add(link)
+        out.append(
+            {
+                "headline": title,
+                "source": source,
+                "published_utc": published_utc,
+                "published_et": published_utc.astimezone(ZoneInfo("America/New_York")),
+                "url": link,
+                "importance": importance,
+            }
+        )
+
+    out.sort(key=lambda x: (x["published_utc"], x["importance"]), reverse=True)
+    return out[:max_items]
+
+
 def build_codex_ticker_prompt(bundle: dict[str, Any]) -> str:
     return (
         "You are a market surveillance research analyst. Use ONLY the evidence JSON below. "
@@ -1142,6 +1771,7 @@ def run_scan(universe: list[str], top_n: int, lookback_hours: int) -> pd.DataFra
     rescored["selection_reason"] = rescored.apply(selection_reason, axis=1)
     rescored.attrs["missing_tickers"] = missing
     rescored.attrs["sec_queried_count"] = len(sec_targets)
+    rescored.attrs["sec_queried_tickers"] = sec_targets
 
     return rescored
 
@@ -1156,6 +1786,7 @@ def get_single_ticker_activity(ticker: str, lookback_hours: int) -> pd.DataFrame
     sec_features = fetch_sec_features([ticker], lookback_days=SEC_LOOKBACK_DAYS_DEFAULT)
     rescored = apply_news_adjustments(scored, news_features, sec_features=sec_features)
     rescored["selection_reason"] = rescored.apply(selection_reason, axis=1)
+    rescored.attrs["sec_queried_tickers"] = [ticker]
     return rescored
 
 
@@ -1189,6 +1820,8 @@ def main() -> None:
         st.session_state["pending_all_stocks_search"] = ""
     if "last_table_selected_ticker" not in st.session_state:
         st.session_state["last_table_selected_ticker"] = ""
+    if "last_sec_queried_tickers" not in st.session_state:
+        st.session_state["last_sec_queried_tickers"] = []
 
     with st.sidebar:
         st.subheader("Scan Controls")
@@ -1227,6 +1860,7 @@ def main() -> None:
                 st.session_state["last_universe_size"] = len(universe)
                 st.session_state["last_run_at"] = now
                 st.session_state["last_missing_tickers"] = ranked.attrs.get("missing_tickers", [])
+                st.session_state["last_sec_queried_tickers"] = ranked.attrs.get("sec_queried_tickers", [])
 
                 run_record = {
                     "run_at_utc": now,
@@ -1258,6 +1892,10 @@ def main() -> None:
     if st.session_state["last_ranked"] is not None:
         ranked = ensure_score_columns(st.session_state["last_ranked"])
         st.session_state["last_ranked"] = ranked
+        st.session_state["last_sec_queried_tickers"] = ranked.attrs.get(
+            "sec_queried_tickers",
+            st.session_state.get("last_sec_queried_tickers", []),
+        )
         top_n = int(st.session_state["last_top_n"])
         universe_size = int(st.session_state["last_universe_size"])
         run_at = st.session_state["last_run_at"]
@@ -1351,52 +1989,43 @@ def main() -> None:
             table_df = all_stocks[display_cols].reset_index(drop=True)
 
             current_selected = str(st.session_state.get("selected_ticker", "")).upper()
-            if len(table_df) == 1:
+            # If search narrows to exactly one row and nothing is selected yet, auto-select once.
+            if len(table_df) == 1 and not current_selected:
                 auto_ticker = str(table_df.iloc[0]["ticker"]).upper()
-                if auto_ticker and auto_ticker != current_selected:
+                if auto_ticker:
                     st.session_state["selected_ticker"] = auto_ticker
                     st.session_state["last_table_selected_ticker"] = auto_ticker
                     st.session_state["pending_all_stocks_search"] = auto_ticker
-                single_df = table_df.copy()
-                single_df.insert(0, "select", [True])
-                st.data_editor(
-                    single_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    height="content",
-                    key="all_stocks_editor_single",
-                    column_config={"select": st.column_config.CheckboxColumn("Select")},
-                    disabled=list(single_df.columns),
-                )
-            else:
-                editor_df = table_df.copy()
-                editor_df.insert(0, "select", editor_df["ticker"].astype(str).str.upper() == current_selected)
-                edited_df = st.data_editor(
-                    editor_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=320,
-                    key="all_stocks_editor",
-                    column_config={
-                        "select": st.column_config.CheckboxColumn("Select"),
-                    },
-                    disabled=[c for c in editor_df.columns if c != "select"],
-                )
+                    st.rerun()
 
-                checked = edited_df[edited_df["select"] == True]
-                if not checked.empty:
-                    picked_ticker = str(checked.iloc[0]["ticker"]).upper()
-                    if picked_ticker != current_selected:
-                        st.session_state["selected_ticker"] = picked_ticker
-                        st.session_state["pending_all_stocks_search"] = picked_ticker
-                        st.session_state["last_table_selected_ticker"] = picked_ticker
-                        st.rerun()
-                else:
-                    if current_selected:
-                        st.session_state["selected_ticker"] = ""
-                        st.session_state["last_table_selected_ticker"] = ""
-                        st.session_state["pending_all_stocks_search"] = "__CLEAR__"
-                        st.rerun()
+            editor_df = table_df.copy()
+            editor_df.insert(0, "select", editor_df["ticker"].astype(str).str.upper() == current_selected)
+            edited_df = st.data_editor(
+                editor_df,
+                use_container_width=True,
+                hide_index=True,
+                height=320,
+                key="all_stocks_editor",
+                column_config={
+                    "select": st.column_config.CheckboxColumn("Select"),
+                },
+                disabled=[c for c in editor_df.columns if c != "select"],
+            )
+
+            checked = edited_df[edited_df["select"] == True]
+            if not checked.empty:
+                picked_ticker = str(checked.iloc[0]["ticker"]).upper()
+                if picked_ticker != current_selected:
+                    st.session_state["selected_ticker"] = picked_ticker
+                    st.session_state["pending_all_stocks_search"] = picked_ticker
+                    st.session_state["last_table_selected_ticker"] = picked_ticker
+                    st.rerun()
+            else:
+                if current_selected:
+                    st.session_state["selected_ticker"] = ""
+                    st.session_state["last_table_selected_ticker"] = ""
+                    st.session_state["pending_all_stocks_search"] = "__CLEAR__"
+                    st.rerun()
 
             if st.session_state.get("selected_ticker"):
                 st.caption(f"Selected from table: {st.session_state['selected_ticker']}")
@@ -1406,25 +2035,54 @@ def main() -> None:
         col1, col2 = st.columns([1.5, 1])
         with col1:
             st.subheader("Top Picks")
-            st.dataframe(
-                top_df[
-                    [
-                        "ticker",
-                        "activity_score",
-                        "market_activity_score",
-                        "info_flow_score",
-                        "price_move_pct",
-                        "volume_ratio",
-                        "mention_count",
-                        "source_diversity",
-                        "filing_flag",
-                        "filing_count",
-                        "selection_reason",
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
+            top_pick_cols = [
+                "ticker",
+                "activity_score",
+                "market_activity_score",
+                "info_flow_score",
+                "price_move_pct",
+                "volume_ratio",
+                "mention_count",
+                "source_diversity",
+                "filing_flag",
+                "filing_count",
+                "selection_reason",
+            ]
+            top_picks_view = top_df[top_pick_cols].reset_index(drop=True)
+            try:
+                st.dataframe(
+                    top_picks_view,
+                    use_container_width=True,
+                    hide_index=True,
+                    selection_mode="single-row",
+                    on_select="rerun",
+                    key="top_picks_table",
+                )
+                top_rows: list[int] = []
+                top_state = st.session_state.get("top_picks_table", {})
+                if isinstance(top_state, dict):
+                    sel = top_state.get("selection", {})
+                    if isinstance(sel, dict):
+                        top_rows = sel.get("rows", []) or []
+                if top_rows:
+                    idx = int(top_rows[0])
+                    if 0 <= idx < len(top_picks_view):
+                        picked_ticker = str(top_picks_view.iloc[idx]["ticker"]).upper()
+                        current_selected = str(st.session_state.get("selected_ticker", "")).upper()
+                        current_all_search = str(st.session_state.get("all_stocks_search", "")).strip().upper()
+                        # Always sync All Stocks search + selected ticker from Top Picks selection.
+                        # This keeps table checkbox state and ticker details consistent.
+                        if (picked_ticker != current_selected) or (current_all_search != picked_ticker):
+                            st.session_state["selected_ticker"] = picked_ticker
+                            st.session_state["last_table_selected_ticker"] = picked_ticker
+                            st.session_state["pending_all_stocks_search"] = picked_ticker
+                            st.rerun()
+            except TypeError:
+                st.dataframe(
+                    top_picks_view,
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
         with col2:
             st.subheader("Run Snapshot")
@@ -1457,6 +2115,32 @@ def main() -> None:
                     selected_row = ensure_score_columns(
                         get_single_ticker_activity(selected_ticker, lookback_hours=lookback_hours)
                     )
+
+            # Ensure selected ticker SEC data is accurate even when outside bounded SEC scan set.
+            sec_queried = {str(t).upper() for t in st.session_state.get("last_sec_queried_tickers", [])}
+            need_sec_refresh = False
+            if selected_ticker not in sec_queried:
+                need_sec_refresh = True
+            elif not selected_row.empty:
+                row0 = selected_row.iloc[0]
+                filing_flag = bool(row0.get("filing_flag", False))
+                filings_list = row0.get("filings", [])
+                has_filings = isinstance(filings_list, list) and len(filings_list) > 0
+                if (not filing_flag) and (not has_filings):
+                    need_sec_refresh = True
+
+            if need_sec_refresh:
+                sec_data = get_recent_sec_filings_for_ticker(selected_ticker, lookback_days=SEC_LOOKBACK_DAYS_DEFAULT)
+                if selected_row.empty:
+                    selected_row = pd.DataFrame([{"ticker": selected_ticker}])
+                selected_row = ensure_score_columns(selected_row)
+                selected_row["filing_flag"] = bool(sec_data.get("filing_flag", False))
+                selected_row["filing_count"] = int(sec_data.get("filing_count", 0) or 0)
+                selected_row["filing_types"] = [sec_data.get("filing_types", []) or []]
+                selected_row["filing_dates"] = [sec_data.get("filing_dates", []) or []]
+                selected_row["latest_filing_time"] = str(sec_data.get("latest_filing_time", "") or "")
+                selected_row["filing_links"] = [sec_data.get("filing_links", []) or []]
+                selected_row["filings"] = [sec_data.get("filings", []) or []]
 
         if not selected_ticker:
             st.info("Select a ticker in 'All US Stocks (S&P 500)' to view activity score and details.")
@@ -1716,6 +2400,70 @@ def main() -> None:
                         height="content",
                     )
 
+                    st.subheader("Latest News (Paywall-safe)")
+                    show_paywalled_links = st.checkbox(
+                        "Show paywalled links (link-only)",
+                        value=True,
+                        key="latest_news_show_paywalled",
+                    )
+                    include_google_news = st.checkbox(
+                        "Include Google News RSS",
+                        value=True,
+                        key="latest_news_include_google",
+                    )
+                    include_company_ir = st.checkbox(
+                        "Include Company IR",
+                        value=True,
+                        key="latest_news_include_ir",
+                    )
+
+                    latest_news_bundle = get_latest_news_bundle(
+                        selected_ticker,
+                        snap.get("name", selected_ticker),
+                        lookback_hours=max(72, int(lookback_hours)),
+                        max_items=40,
+                    )
+                    news_items = list(latest_news_bundle.get("items", []) or [])
+                    if not include_google_news:
+                        news_items = [n for n in news_items if str(n.get("source", "")) != "GoogleNewsRSS"]
+                    if not include_company_ir:
+                        news_items = [n for n in news_items if str(n.get("source", "")) != "CompanyIR"]
+                    if not show_paywalled_links:
+                        news_items = [n for n in news_items if not bool(n.get("paywalled_suspected", False))]
+
+                    if not news_items:
+                        st.caption("No latest news items match current filters.")
+                    else:
+                        st.caption(f"{len(news_items)} item(s) across SEC, IR, RSS metadata and open providers.")
+                        for item in news_items:
+                            headline = str(item.get("headline", "")).strip()
+                            link = str(item.get("url", "")).strip()
+                            source = str(item.get("source", "Other")).strip()
+                            snippet = str(item.get("snippet", "")).strip()
+                            published_at = str(item.get("published_at", "")).strip()
+                            paywalled = bool(item.get("paywalled_suspected", False))
+                            content_fetched = bool(item.get("content_fetched", False))
+                            fetch_reason = str(item.get("fetch_reason", "error"))
+                            badge = " `link-only`" if paywalled or not content_fetched else ""
+                            if link:
+                                st.markdown(f"- [{headline}]({link}){badge}")
+                            else:
+                                st.markdown(f"- {headline}{badge}")
+                            time_txt = published_at
+                            try:
+                                dt = datetime.fromisoformat(published_at)
+                                if dt.tzinfo is None:
+                                    dt = dt.replace(tzinfo=UTC)
+                                time_txt = dt.astimezone(ZoneInfo("America/New_York")).strftime("%b %d, %I:%M %p ET")
+                            except Exception:
+                                pass
+                            st.caption(
+                                f"{source} • {time_txt} • paywalled={paywalled} • "
+                                f"content_fetched={content_fetched} • reason={fetch_reason}"
+                            )
+                            if snippet:
+                                st.caption(snippet[:320])
+
                     st.subheader("SEC Filings (recent)")
                     # Always do an on-demand SEC pull for the selected ticker so details are current,
                     # even if this ticker was outside the bounded SEC scan set.
@@ -1805,12 +2553,12 @@ def main() -> None:
                 st.warning(f"Unable to load ticker details: {exc}")
 
     st.divider()
-    st.subheader("Research Notes")
     if not selected_ticker_for_notes and st.session_state["last_ranked"] is not None:
         fallback = st.session_state["last_ranked"].head(1)
         if not fallback.empty:
             selected_ticker_for_notes = str(fallback.iloc[0]["ticker"])
 
+    st.subheader("Research Notes")
     if not selected_ticker_for_notes:
         st.info("Run a scan and select a ticker to load research notes.")
     else:
