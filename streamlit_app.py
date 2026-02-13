@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from difflib import get_close_matches
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
@@ -58,6 +59,11 @@ SENT_NEG = {
 SEC_RELEVANT_FORMS = {"8-K", "4", "10-Q", "10-K"}
 SEC_LOOKBACK_DAYS_DEFAULT = 2
 SEC_USER_AGENT = "SignalWeave/1.0 (contact: your-email@example.com)"
+SEC_MAX_TICKERS_PER_SCAN = 75
+SEC_REQUEST_THROTTLE_SEC = 0.12
+
+# Tracks CIKs fetched in this process so throttle is only applied for first network fetch.
+SEC_FETCHED_CIKS: set[str] = set()
 
 
 def ensure_data_dir() -> None:
@@ -385,11 +391,20 @@ def get_sec_ticker_cik_map() -> dict[str, str]:
 
 
 @st.cache_data(ttl=6 * 3600)
-def get_sec_submissions_json(cik_10: str) -> dict[str, Any]:
+def _get_sec_submissions_json_cached(cik_10: str) -> dict[str, Any]:
     url = f"https://data.sec.gov/submissions/CIK{cik_10}.json"
     req = Request(url, headers={"User-Agent": SEC_USER_AGENT, "Accept": "application/json"})
     with urlopen(req, timeout=20) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def get_sec_submissions_json(cik_10: str) -> dict[str, Any]:
+    # Apply throttle only before first fetch for a CIK in this process.
+    if cik_10 not in SEC_FETCHED_CIKS:
+        time.sleep(SEC_REQUEST_THROTTLE_SEC)
+    payload = _get_sec_submissions_json_cached(cik_10)
+    SEC_FETCHED_CIKS.add(cik_10)
+    return payload
 
 
 def _default_sec_features() -> dict[str, Any]:
@@ -453,8 +468,21 @@ def get_recent_sec_filings_for_ticker(ticker: str, lookback_days: int = SEC_LOOK
             cik_int = str(int(cik_10))
         except Exception:
             cik_int = cik_10.lstrip("0") or "0"
-        link = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/{doc}" if acc_nodash and doc else ""
-        selected.append({"form": form, "date": date_str, "link": link})
+        index_link = (
+            f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/{acc}-index.html"
+            if acc_nodash and acc
+            else ""
+        )
+        primary_link = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/{doc}" if acc_nodash and doc else ""
+        selected.append(
+            {
+                "form": form,
+                "date": date_str,
+                "link": index_link or primary_link,
+                "index_link": index_link,
+                "primary_link": primary_link,
+            }
+        )
 
     if not selected:
         return _default_sec_features()
@@ -490,6 +518,42 @@ def fetch_sec_features(tickers: list[str], lookback_days: int = SEC_LOOKBACK_DAY
         except Exception:
             out[t] = _default_sec_features()
     return out
+
+
+def choose_sec_tickers(
+    scored: pd.DataFrame,
+    candidate_pool: pd.DataFrame,
+    news_features: dict[str, dict[str, Any]],
+    max_tickers: int = SEC_MAX_TICKERS_PER_SCAN,
+) -> list[str]:
+    max_tickers = max(1, int(max_tickers))
+    chosen: list[str] = []
+    seen: set[str] = set()
+
+    # 1) Candidate pool first (already sorted by market_activity_score desc).
+    for t in candidate_pool["ticker"].astype(str).tolist():
+        if t not in seen:
+            seen.add(t)
+            chosen.append(t)
+        if len(chosen) >= max_tickers:
+            return chosen[:max_tickers]
+
+    # 2) Any additional tickers with non-zero news mentions, prioritized by market score.
+    mention_tickers = {
+        str(t)
+        for t, payload in news_features.items()
+        if int(payload.get("mention_count", 0) or 0) > 0
+    }
+    if mention_tickers:
+        ranked = scored.sort_values("market_activity_score", ascending=False)
+        for t in ranked["ticker"].astype(str).tolist():
+            if t in mention_tickers and t not in seen:
+                seen.add(t)
+                chosen.append(t)
+            if len(chosen) >= max_tickers:
+                break
+
+    return chosen[:max_tickers]
 
 
 def fetch_news_features(tickers: list[str], lookback_hours: int) -> dict[str, dict[str, Any]]:
@@ -715,6 +779,58 @@ def fmt_pct(value: Any) -> str:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return "-"
     return f"{float(value):.2f}%"
+
+
+def rank_all_stocks_matches(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    q = str(query or "").strip().upper()
+    base = df.copy()
+    if base.empty:
+        return base
+    if not q:
+        return base.sort_values(["company_name", "ticker"]).reset_index(drop=True)
+
+    ticker_u = base["ticker"].astype(str).str.upper()
+    company_u = base["company_name"].astype(str).str.upper()
+
+    # If query is an exact ticker, return only that ticker for a crisp experience.
+    exact_ticker = base[ticker_u == q]
+    if not exact_ticker.empty:
+        return exact_ticker.sort_values(["company_name", "ticker"]).reset_index(drop=True)
+
+    labels = (ticker_u + " " + company_u).tolist()
+
+    fuzzy_hits: set[int] = set()
+    if len(q) >= 2:
+        fuzzy_labels = set(get_close_matches(q, labels, n=min(30, len(labels)), cutoff=0.75))
+        fuzzy_hits = {i for i, label in enumerate(labels) if label in fuzzy_labels}
+
+    rank_bucket: list[int | None] = []
+    for i in range(len(base)):
+        t = ticker_u.iloc[i]
+        c = company_u.iloc[i]
+        bucket: int | None = None
+        if t == q:
+            bucket = 0
+        elif t.startswith(q):
+            bucket = 1
+        elif c.startswith(q):
+            bucket = 2
+        elif q in t:
+            bucket = 3
+        elif q in c:
+            bucket = 4
+        elif i in fuzzy_hits:
+            bucket = 5
+        rank_bucket.append(bucket)
+
+    ranked = base.copy()
+    ranked["_rank_bucket"] = rank_bucket
+    ranked = ranked[ranked["_rank_bucket"].notna()].copy()
+    if ranked.empty:
+        return ranked.drop(columns=["_rank_bucket"], errors="ignore")
+    ranked["_rank_bucket"] = ranked["_rank_bucket"].astype(int)
+    ranked = ranked.sort_values(["_rank_bucket", "company_name", "ticker"]).reset_index(drop=True)
+    return ranked.drop(columns=["_rank_bucket"], errors="ignore")
 
 
 @st.cache_data(ttl=60)
@@ -1014,11 +1130,18 @@ def run_scan(universe: list[str], top_n: int, lookback_hours: int) -> pd.DataFra
     candidate_pool = scored.sort_values("market_activity_score", ascending=False).head(max(top_n * 6, 80))
 
     news_features = fetch_news_features(candidate_pool["ticker"].tolist(), lookback_hours=lookback_hours)
-    sec_features = fetch_sec_features(scored["ticker"].tolist(), lookback_days=SEC_LOOKBACK_DAYS_DEFAULT)
+    sec_targets = choose_sec_tickers(
+        scored=scored,
+        candidate_pool=candidate_pool,
+        news_features=news_features,
+        max_tickers=SEC_MAX_TICKERS_PER_SCAN,
+    )
+    sec_features = fetch_sec_features(sec_targets, lookback_days=SEC_LOOKBACK_DAYS_DEFAULT)
     rescored = apply_news_adjustments(scored, news_features, sec_features=sec_features)
     rescored = rescored.sort_values(["activity_score", "ticker"], ascending=[False, True]).reset_index(drop=True)
     rescored["selection_reason"] = rescored.apply(selection_reason, axis=1)
     rescored.attrs["missing_tickers"] = missing
+    rescored.attrs["sec_queried_count"] = len(sec_targets)
 
     return rescored
 
@@ -1062,6 +1185,10 @@ def main() -> None:
         st.session_state["last_missing_tickers"] = []
     if "selected_ticker" not in st.session_state:
         st.session_state["selected_ticker"] = ""
+    if "pending_all_stocks_search" not in st.session_state:
+        st.session_state["pending_all_stocks_search"] = ""
+    if "last_table_selected_ticker" not in st.session_state:
+        st.session_state["last_table_selected_ticker"] = ""
 
     with st.sidebar:
         st.subheader("Scan Controls")
@@ -1148,6 +1275,15 @@ def main() -> None:
             )
 
         st.subheader("All US Stocks (S&P 500)")
+        pending_search_raw = str(st.session_state.get("pending_all_stocks_search", ""))
+        if pending_search_raw == "__CLEAR__":
+            st.session_state["all_stocks_search"] = ""
+            st.session_state["pending_all_stocks_search"] = ""
+        else:
+            pending_search = pending_search_raw.strip().upper()
+            if pending_search:
+                st.session_state["all_stocks_search"] = pending_search
+                st.session_state["pending_all_stocks_search"] = ""
         all_stocks_query = st.text_input(
             "Search all stocks (ticker or company name)",
             value="",
@@ -1157,16 +1293,44 @@ def main() -> None:
         try:
             universe_df = get_sp500_universe_df()
             score_cols = ranked[
-                ["ticker", "activity_score", "market_activity_score", "info_flow_score", "filing_flag", "filing_count"]
+                [
+                    "ticker",
+                    "activity_score",
+                    "market_activity_score",
+                    "info_flow_score",
+                    "filing_flag",
+                    "filing_count",
+                    "price_move_pct",
+                    "volume_ratio",
+                    "mention_count",
+                    "source_diversity",
+                ]
             ].copy()
             all_stocks = universe_df.merge(score_cols, on="ticker", how="left")
             all_stocks = all_stocks.sort_values(["company_name", "ticker"]).reset_index(drop=True)
 
-            if all_stocks_query:
-                all_stocks = all_stocks[
-                    all_stocks["ticker"].str.contains(all_stocks_query, na=False)
-                    | all_stocks["company_name"].str.upper().str.contains(all_stocks_query, na=False)
-                ]
+            f1, f2, f3, f4 = st.columns(4)
+            with f1:
+                only_movers = st.checkbox("Only movers", value=False, key="flt_only_movers")
+            with f2:
+                only_volume_spikes = st.checkbox("Only volume spikes", value=False, key="flt_only_volume_spikes")
+            with f3:
+                only_news_active = st.checkbox("Only news active", value=False, key="flt_only_news_active")
+            with f4:
+                only_sec_filings = st.checkbox("Only SEC filings", value=False, key="flt_only_sec_filings")
+
+            if only_movers:
+                all_stocks = all_stocks[pd.to_numeric(all_stocks["price_move_pct"], errors="coerce").abs() >= 2.0]
+            if only_volume_spikes:
+                all_stocks = all_stocks[pd.to_numeric(all_stocks["volume_ratio"], errors="coerce") >= 1.5]
+            if only_news_active:
+                mentions = pd.to_numeric(all_stocks["mention_count"], errors="coerce").fillna(0)
+                sources = pd.to_numeric(all_stocks["source_diversity"], errors="coerce").fillna(0)
+                all_stocks = all_stocks[(mentions > 0) | (sources > 0)]
+            if only_sec_filings:
+                all_stocks = all_stocks[all_stocks["filing_flag"] == True]
+
+            all_stocks = rank_all_stocks_matches(all_stocks, all_stocks_query)
 
             display_cols = [
                 "company_name",
@@ -1177,53 +1341,65 @@ def main() -> None:
                 "filing_flag",
                 "filing_count",
             ]
+            show_extra_cols = st.checkbox(
+                "Show extra activity columns (price/volume/news)",
+                value=True,
+                key="all_stocks_show_extra_cols",
+            )
+            if show_extra_cols:
+                display_cols.extend(["price_move_pct", "volume_ratio", "mention_count", "source_diversity"])
             table_df = all_stocks[display_cols].reset_index(drop=True)
 
-            try:
-                st.dataframe(
-                    table_df,
+            current_selected = str(st.session_state.get("selected_ticker", "")).upper()
+            if len(table_df) == 1:
+                auto_ticker = str(table_df.iloc[0]["ticker"]).upper()
+                if auto_ticker and auto_ticker != current_selected:
+                    st.session_state["selected_ticker"] = auto_ticker
+                    st.session_state["last_table_selected_ticker"] = auto_ticker
+                    st.session_state["pending_all_stocks_search"] = auto_ticker
+                single_df = table_df.copy()
+                single_df.insert(0, "select", [True])
+                st.data_editor(
+                    single_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    height="content",
+                    key="all_stocks_editor_single",
+                    column_config={"select": st.column_config.CheckboxColumn("Select")},
+                    disabled=list(single_df.columns),
+                )
+            else:
+                editor_df = table_df.copy()
+                editor_df.insert(0, "select", editor_df["ticker"].astype(str).str.upper() == current_selected)
+                edited_df = st.data_editor(
+                    editor_df,
                     use_container_width=True,
                     hide_index=True,
                     height=320,
-                    selection_mode="single-row",
-                    on_select="rerun",
-                    key="all_stocks_table",
+                    key="all_stocks_editor",
+                    column_config={
+                        "select": st.column_config.CheckboxColumn("Select"),
+                    },
+                    disabled=[c for c in editor_df.columns if c != "select"],
                 )
-                rows: list[int] = []
-                state = st.session_state.get("all_stocks_table", {})
-                if isinstance(state, dict):
-                    sel = state.get("selection", {})
-                    if isinstance(sel, dict):
-                        rows = sel.get("rows", []) or []
-                if rows:
-                    idx = int(rows[0])
-                    if 0 <= idx < len(table_df):
-                        picked_ticker = str(table_df.iloc[idx]["ticker"]).upper()
+
+                checked = edited_df[edited_df["select"] == True]
+                if not checked.empty:
+                    picked_ticker = str(checked.iloc[0]["ticker"]).upper()
+                    if picked_ticker != current_selected:
                         st.session_state["selected_ticker"] = picked_ticker
-                if st.session_state.get("selected_ticker"):
-                    st.caption(f"Selected from table: {st.session_state['selected_ticker']}")
-            except TypeError:
-                # Fallback for older Streamlit versions without dataframe row selection.
-                st.dataframe(
-                    table_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=320,
-                )
-                option_map = {
-                    f"{row['company_name']} ({row['ticker']})": str(row["ticker"]).upper()
-                    for _, row in table_df.iterrows()
-                }
-                picked = st.selectbox(
-                    "Select a ticker from search results",
-                    options=[""] + list(option_map.keys()),
-                    index=0,
-                    key="all_stocks_fallback_select",
-                )
-                if picked:
-                    picked_ticker = option_map[picked]
-                    st.session_state["selected_ticker"] = picked_ticker
-                    st.caption(f"Selected from table: {st.session_state['selected_ticker']}")
+                        st.session_state["pending_all_stocks_search"] = picked_ticker
+                        st.session_state["last_table_selected_ticker"] = picked_ticker
+                        st.rerun()
+                else:
+                    if current_selected:
+                        st.session_state["selected_ticker"] = ""
+                        st.session_state["last_table_selected_ticker"] = ""
+                        st.session_state["pending_all_stocks_search"] = "__CLEAR__"
+                        st.rerun()
+
+            if st.session_state.get("selected_ticker"):
+                st.caption(f"Selected from table: {st.session_state['selected_ticker']}")
         except Exception as exc:
             st.warning(f"Unable to load S&P 500 name list: {exc}")
 
@@ -1307,6 +1483,41 @@ def main() -> None:
                 hide_index=True,
                 height="content",
             )
+
+            with st.expander("Evidence preview", expanded=True):
+                recent_news = get_ticker_news_items(selected_ticker, lookback_hours=lookback_hours, max_items=3)
+                if not recent_news:
+                    st.caption("No recent headlines available.")
+                else:
+                    for i, item in enumerate(recent_news[:3], start=1):
+                        headline = item.get("headline", "")
+                        source = item.get("source", "Unknown")
+                        ts = item.get("time_utc", "")
+                        snippet = item.get("snippet", "")
+                        url = item.get("url", "")
+                        if url:
+                            st.markdown(f"{i}. [{headline}]({url})")
+                        else:
+                            st.markdown(f"{i}. {headline}")
+                        if snippet:
+                            st.caption(f"{source} • {ts} • {snippet[:220]}")
+                        else:
+                            st.caption(f"{source} • {ts}")
+
+                latest_type = "-"
+                latest_date = "-"
+                if "filings" in selected_row.columns and not selected_row["filings"].empty:
+                    filings = selected_row.iloc[0].get("filings", []) or []
+                    if filings:
+                        latest = filings[0]
+                        latest_type = str(latest.get("form", "-"))
+                        latest_date = str(latest.get("date", "-"))
+                elif bool(selected_row.iloc[0].get("filing_flag", False)):
+                    types = selected_row.iloc[0].get("filing_types", []) or []
+                    dates = selected_row.iloc[0].get("filing_dates", []) or []
+                    latest_type = str(types[0]) if types else "-"
+                    latest_date = str(dates[0]) if dates else str(selected_row.iloc[0].get("latest_filing_time", "-"))
+                st.caption(f"Most recent filing: {latest_type} on {latest_date}")
 
         st.subheader("Ticker Details")
         if not selected_ticker:
@@ -1506,20 +1717,11 @@ def main() -> None:
                     )
 
                     st.subheader("SEC Filings (recent)")
-                    sec_data = None
-                    if not selected_row.empty:
-                        row0 = selected_row.iloc[0]
-                        sec_data = {
-                            "filing_flag": bool(row0.get("filing_flag", False)),
-                            "filing_count": int(row0.get("filing_count", 0) or 0),
-                            "filing_types": row0.get("filing_types", []) or [],
-                            "latest_filing_time": str(row0.get("latest_filing_time", "") or ""),
-                            "filing_links": row0.get("filing_links", []) or [],
-                        }
-                    if sec_data is None:
-                        sec_data = get_recent_sec_filings_for_ticker(
-                            selected_ticker, lookback_days=SEC_LOOKBACK_DAYS_DEFAULT
-                        )
+                    # Always do an on-demand SEC pull for the selected ticker so details are current,
+                    # even if this ticker was outside the bounded SEC scan set.
+                    sec_data = get_recent_sec_filings_for_ticker(
+                        selected_ticker, lookback_days=SEC_LOOKBACK_DAYS_DEFAULT
+                    )
 
                     if not sec_data.get("filing_flag", False):
                         st.caption(
