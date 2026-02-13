@@ -55,7 +55,9 @@ SENT_NEG = {
     "lawsuit",
     "probe",
 }
-FILING_HINTS = {"8-k", "10-q", "10-k", "sec filing", "form 4", "proxy statement"}
+SEC_RELEVANT_FORMS = {"8-K", "4", "10-Q", "10-K"}
+SEC_LOOKBACK_DAYS_DEFAULT = 2
+SEC_USER_AGENT = "SignalWeave/1.0 (contact: your-email@example.com)"
 
 
 def ensure_data_dir() -> None:
@@ -193,6 +195,20 @@ def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
         out["info_flow_score"] = 50.0
     if "activity_score" not in out.columns:
         out["activity_score"] = (0.65 * out["market_activity_score"] + 0.35 * out["info_flow_score"]).round().astype(int)
+    if "filing_flag" not in out.columns:
+        out["filing_flag"] = False
+    if "filing_count" not in out.columns:
+        out["filing_count"] = 0
+    if "filing_types" not in out.columns:
+        out["filing_types"] = [[] for _ in range(len(out))]
+    if "latest_filing_time" not in out.columns:
+        out["latest_filing_time"] = ""
+    if "filing_links" not in out.columns:
+        out["filing_links"] = [[] for _ in range(len(out))]
+    if "filing_dates" not in out.columns:
+        out["filing_dates"] = [[] for _ in range(len(out))]
+    if "filings" not in out.columns:
+        out["filings"] = [[] for _ in range(len(out))]
     return out
 
 
@@ -344,6 +360,138 @@ def _headline_sentiment(title: str) -> float:
     return float(pos - neg)
 
 
+@st.cache_data(ttl=24 * 3600)
+def get_sec_ticker_cik_map() -> dict[str, str]:
+    url = "https://www.sec.gov/files/company_tickers.json"
+    req = Request(url, headers={"User-Agent": SEC_USER_AGENT, "Accept": "application/json"})
+    with urlopen(req, timeout=20) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+
+    out: dict[str, str] = {}
+    if isinstance(payload, dict):
+        for _, row in payload.items():
+            if not isinstance(row, dict):
+                continue
+            t = str(row.get("ticker", "")).strip().upper()
+            cik_num = row.get("cik_str")
+            if not t or cik_num is None:
+                continue
+            try:
+                cik = f"{int(cik_num):010d}"
+            except Exception:
+                continue
+            out[t] = cik
+    return out
+
+
+@st.cache_data(ttl=6 * 3600)
+def get_sec_submissions_json(cik_10: str) -> dict[str, Any]:
+    url = f"https://data.sec.gov/submissions/CIK{cik_10}.json"
+    req = Request(url, headers={"User-Agent": SEC_USER_AGENT, "Accept": "application/json"})
+    with urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _default_sec_features() -> dict[str, Any]:
+    return {
+        "filing_flag": False,
+        "filing_count": 0,
+        "filing_types": [],
+        "filing_dates": [],
+        "latest_filing_time": "",
+        "filing_links": [],
+        "filings": [],
+    }
+
+
+@st.cache_data(ttl=3600)
+def get_recent_sec_filings_for_ticker(ticker: str, lookback_days: int = SEC_LOOKBACK_DAYS_DEFAULT) -> dict[str, Any]:
+    t = str(ticker).strip().upper()
+    if not t:
+        return _default_sec_features()
+    try:
+        cik_map = get_sec_ticker_cik_map()
+    except Exception:
+        return _default_sec_features()
+
+    cik_10 = cik_map.get(t)
+    if not cik_10:
+        return _default_sec_features()
+
+    try:
+        sub = get_sec_submissions_json(cik_10)
+        recent = (sub.get("filings") or {}).get("recent") or {}
+        forms = recent.get("form") or []
+        filing_dates = recent.get("filingDate") or []
+        accession_numbers = recent.get("accessionNumber") or []
+        primary_docs = recent.get("primaryDocument") or []
+    except Exception:
+        return _default_sec_features()
+
+    n = min(len(forms), len(filing_dates), len(accession_numbers), len(primary_docs))
+    if n <= 0:
+        return _default_sec_features()
+
+    cutoff = datetime.now(UTC).date() - timedelta(days=max(1, int(lookback_days)))
+    selected: list[dict[str, str]] = []
+    for i in range(n):
+        form = str(forms[i] or "").strip().upper()
+        if form not in SEC_RELEVANT_FORMS:
+            continue
+        date_str = str(filing_dates[i] or "").strip()
+        try:
+            filed_date = datetime.fromisoformat(date_str).date()
+        except Exception:
+            continue
+        if filed_date < cutoff:
+            continue
+
+        acc = str(accession_numbers[i] or "").strip()
+        doc = str(primary_docs[i] or "").strip()
+        acc_nodash = acc.replace("-", "")
+        try:
+            cik_int = str(int(cik_10))
+        except Exception:
+            cik_int = cik_10.lstrip("0") or "0"
+        link = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/{doc}" if acc_nodash and doc else ""
+        selected.append({"form": form, "date": date_str, "link": link})
+
+    if not selected:
+        return _default_sec_features()
+
+    filing_types: list[str] = []
+    for s in selected:
+        if s["form"] not in filing_types:
+            filing_types.append(s["form"])
+    links = [s["link"] for s in selected if s.get("link")][:3]
+    filing_dates = []
+    for s in selected:
+        d = s.get("date", "")
+        if d and d not in filing_dates:
+            filing_dates.append(d)
+    latest = max((s["date"] for s in selected), default="")
+
+    return {
+        "filing_flag": True,
+        "filing_count": len(selected),
+        "filing_types": filing_types,
+        "filing_dates": filing_dates[:5],
+        "latest_filing_time": latest,
+        "filing_links": links,
+        "filings": selected[:10],
+    }
+
+
+def fetch_sec_features(tickers: list[str], lookback_days: int = SEC_LOOKBACK_DAYS_DEFAULT) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for t in tickers:
+        try:
+            out[t] = get_recent_sec_filings_for_ticker(t, lookback_days=lookback_days)
+        except Exception:
+            out[t] = _default_sec_features()
+    return out
+
+
 def fetch_news_features(tickers: list[str], lookback_hours: int) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     cutoff = datetime.now(UTC) - timedelta(hours=lookback_hours)
@@ -352,7 +500,6 @@ def fetch_news_features(tickers: list[str], lookback_hours: int) -> dict[str, di
         mention_count = 0
         providers: set[str] = set()
         sent_values: list[float] = []
-        filing_flag = False
 
         try:
             news_items = yf.Ticker(ticker).news or []
@@ -376,10 +523,6 @@ def fetch_news_features(tickers: list[str], lookback_hours: int) -> dict[str, di
             title = str(item.get("title") or "")
             sent_values.append(_headline_sentiment(title))
 
-            low_title = title.lower()
-            if any(k in low_title for k in FILING_HINTS):
-                filing_flag = True
-
         sentiment_shift = 0.0
         if sent_values:
             sentiment_shift = max(sent_values) - min(sent_values)
@@ -387,34 +530,50 @@ def fetch_news_features(tickers: list[str], lookback_hours: int) -> dict[str, di
         out[ticker] = {
             "mention_count": mention_count,
             "source_diversity": len(providers),
-            "filing_flag": filing_flag,
             "sentiment_shift": sentiment_shift,
         }
 
     return out
 
 
-def apply_news_adjustments(df: pd.DataFrame, news: dict[str, dict[str, Any]]) -> pd.DataFrame:
+def apply_news_adjustments(
+    df: pd.DataFrame,
+    news: dict[str, dict[str, Any]],
+    sec_features: dict[str, dict[str, Any]] | None = None,
+) -> pd.DataFrame:
     if df.empty:
         return df
 
     out = df.copy()
     out["mention_count"] = out["ticker"].map(lambda t: news.get(t, {}).get("mention_count", 0)).fillna(0)
     out["source_diversity"] = out["ticker"].map(lambda t: news.get(t, {}).get("source_diversity", 0)).fillna(0)
-    out["filing_flag"] = out["ticker"].map(lambda t: bool(news.get(t, {}).get("filing_flag", False)))
     out["sentiment_shift"] = out["ticker"].map(lambda t: float(news.get(t, {}).get("sentiment_shift", 0.0))).fillna(0.0)
+    sec = sec_features or {}
+    out["filing_flag"] = out["ticker"].map(lambda t: bool(sec.get(t, {}).get("filing_flag", False)))
+    out["filing_count"] = out["ticker"].map(lambda t: int(sec.get(t, {}).get("filing_count", 0))).fillna(0).astype(int)
+    out["filing_types"] = out["ticker"].map(lambda t: sec.get(t, {}).get("filing_types", []) or [])
+    out["latest_filing_time"] = out["ticker"].map(lambda t: str(sec.get(t, {}).get("latest_filing_time", "")))
+    out["filing_links"] = out["ticker"].map(lambda t: sec.get(t, {}).get("filing_links", []) or [])
 
     mention_log = out["mention_count"].map(lambda x: math.log1p(max(0.0, float(x))))
     source_log = out["source_diversity"].map(lambda x: math.log1p(max(0.0, float(x))))
     sent_abs = pd.to_numeric(out["sentiment_shift"], errors="coerce").abs().fillna(0.0)
     filing_num = out["filing_flag"].astype(float)
+    filing_count_scaled = pd.to_numeric(out["filing_count"], errors="coerce").fillna(0.0).clip(lower=0, upper=3) / 3.0
 
     mention_z = robust_zscore(mention_log)
     source_z = robust_zscore(source_log)
     sent_z = robust_zscore(sent_abs)
     interaction = ((out["mention_count"] > 0) & (out["source_diversity"] > 0)).astype(float)
 
-    raw_info = (0.40 * mention_z) + (0.25 * source_z) + (0.20 * sent_z) + (0.20 * interaction) + (0.35 * filing_num)
+    raw_info = (
+        (0.40 * mention_z)
+        + (0.25 * source_z)
+        + (0.20 * sent_z)
+        + (0.20 * interaction)
+        + (0.25 * filing_num)
+        + (0.15 * filing_count_scaled)
+    )
     out["raw_info_flow"] = raw_info
     out["info_flow_score"] = normalized_score_from_raw(raw_info).round(1)
 
@@ -428,7 +587,13 @@ def selection_reason(row: pd.Series) -> str:
     parts: list[str] = []
 
     if row.get("filing_flag", False):
-        parts.append("possible filing-related headline flow")
+        filing_count = int(row.get("filing_count", 0) or 0)
+        filing_types = row.get("filing_types", []) or []
+        types_label = ", ".join(str(x) for x in filing_types[:3]) if filing_types else "SEC filings"
+        if filing_count > 0:
+            parts.append(f"recent SEC filing activity ({filing_count}: {types_label})")
+        else:
+            parts.append("recent SEC filing activity")
 
     move = float(row["price_move_pct"])
     vol = float(row["volume_ratio"])
@@ -718,15 +883,11 @@ def get_ticker_research_notes(ticker: str, lookback_hours: int, max_items: int =
         provider = str(item.get("publisher") or item.get("provider") or "Unknown").strip()
         link = str(item.get("link") or "")
         sentiment = _headline_sentiment(title)
-        low_title = title.lower()
-        filing_hint = any(k in low_title for k in FILING_HINTS)
         in_window = published_utc >= cutoff
 
         tags: list[str] = []
         if in_window:
             tags.append("contributed to activity score window")
-        if filing_hint:
-            tags.append("filing-related")
         if sentiment >= 1:
             tags.append("positive sentiment signal")
         elif sentiment <= -1:
@@ -748,6 +909,68 @@ def get_ticker_research_notes(ticker: str, lookback_hours: int, max_items: int =
 
     notes.sort(key=lambda x: x["published_utc"], reverse=True)
     return notes[:max_items]
+
+
+@st.cache_data(ttl=300)
+def get_ticker_news_items(ticker: str, lookback_hours: int, max_items: int = 15) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    cutoff = datetime.now(UTC) - timedelta(hours=lookback_hours)
+    try:
+        news_items = yf.Ticker(ticker).news or []
+    except Exception:
+        news_items = []
+
+    for n in news_items:
+        ts = n.get("providerPublishTime")
+        if ts is None:
+            continue
+        published = datetime.fromtimestamp(ts, tz=UTC)
+        if published < cutoff:
+            continue
+        title = str(n.get("title") or "").strip()
+        if not title:
+            continue
+        items.append(
+            {
+                "headline": title,
+                "snippet": str(n.get("summary") or n.get("snippet") or "").strip(),
+                "source": str(n.get("publisher") or n.get("provider") or "Unknown").strip(),
+                "time_utc": published.isoformat(),
+                "url": str(n.get("link") or "").strip(),
+            }
+        )
+
+    items.sort(key=lambda x: x["time_utc"], reverse=True)
+    return items[:max_items]
+
+
+def build_codex_ticker_prompt(bundle: dict[str, Any]) -> str:
+    return (
+        "You are a market surveillance research analyst. Use ONLY the evidence JSON below. "
+        "Do not use external sources or assumptions beyond the provided evidence.\n\n"
+        f"Evidence JSON:\n{json.dumps(bundle, ensure_ascii=True, indent=2)}\n\n"
+        "Task:\n"
+        "1) Classify signal_category as one of: EARLY_CATALYST, CONFIRMED_MOMENTUM, NO_SIGNAL.\n"
+        "2) Provide recommended_action as one of: BUY, SELL, HOLD, NO_ACTION (paper trading context only).\n"
+        "3) Provide confidence as an integer 0-100.\n"
+        "4) List catalysts.\n"
+        "5) List evidence items (concise).\n"
+        "6) List contradictions / uncertainty factors.\n"
+        "7) Give 1-3 sentence reasoning.\n"
+        "8) Provide time_horizon (e.g., intraday, 1-3 days, 1-2 weeks).\n\n"
+        "Output STRICT JSON only in this schema:\n"
+        "{\n"
+        '  "ticker": "STRING",\n'
+        '  "signal_category": "EARLY_CATALYST|CONFIRMED_MOMENTUM|NO_SIGNAL",\n'
+        '  "recommended_action": "BUY|SELL|HOLD|NO_ACTION",\n'
+        '  "confidence": 0,\n'
+        '  "time_horizon": "STRING",\n'
+        '  "catalysts": ["STRING"],\n'
+        '  "evidence": ["STRING"],\n'
+        '  "contradictions": ["STRING"],\n'
+        '  "reasoning": "STRING"\n'
+        "}"
+    )
 
 
 def run_scan(universe: list[str], top_n: int, lookback_hours: int) -> pd.DataFrame:
@@ -791,7 +1014,8 @@ def run_scan(universe: list[str], top_n: int, lookback_hours: int) -> pd.DataFra
     candidate_pool = scored.sort_values("market_activity_score", ascending=False).head(max(top_n * 6, 80))
 
     news_features = fetch_news_features(candidate_pool["ticker"].tolist(), lookback_hours=lookback_hours)
-    rescored = apply_news_adjustments(scored, news_features)
+    sec_features = fetch_sec_features(scored["ticker"].tolist(), lookback_days=SEC_LOOKBACK_DAYS_DEFAULT)
+    rescored = apply_news_adjustments(scored, news_features, sec_features=sec_features)
     rescored = rescored.sort_values(["activity_score", "ticker"], ascending=[False, True]).reset_index(drop=True)
     rescored["selection_reason"] = rescored.apply(selection_reason, axis=1)
     rescored.attrs["missing_tickers"] = missing
@@ -806,7 +1030,8 @@ def get_single_ticker_activity(ticker: str, lookback_hours: int) -> pd.DataFrame
         return pd.DataFrame()
     scored = score_base_metrics(metrics)
     news_features = fetch_news_features([ticker], lookback_hours=lookback_hours)
-    rescored = apply_news_adjustments(scored, news_features)
+    sec_features = fetch_sec_features([ticker], lookback_days=SEC_LOOKBACK_DAYS_DEFAULT)
+    rescored = apply_news_adjustments(scored, news_features, sec_features=sec_features)
     rescored["selection_reason"] = rescored.apply(selection_reason, axis=1)
     return rescored
 
@@ -835,6 +1060,8 @@ def main() -> None:
         st.session_state["last_run_at"] = None
     if "last_missing_tickers" not in st.session_state:
         st.session_state["last_missing_tickers"] = []
+    if "selected_ticker" not in st.session_state:
+        st.session_state["selected_ticker"] = ""
 
     with st.sidebar:
         st.subheader("Scan Controls")
@@ -885,6 +1112,8 @@ def main() -> None:
                             "activity_score": int(r["activity_score"]),
                             "market_activity_score": float(r.get("market_activity_score", 50.0)),
                             "info_flow_score": float(r.get("info_flow_score", 50.0)),
+                            "filing_flag": bool(r.get("filing_flag", False)),
+                            "filing_count": int(r.get("filing_count", 0)),
                             "entry_price": float(r["price"]),
                             "selection_reason": r["selection_reason"],
                         }
@@ -927,7 +1156,9 @@ def main() -> None:
         ).strip().upper()
         try:
             universe_df = get_sp500_universe_df()
-            score_cols = ranked[["ticker", "activity_score", "market_activity_score", "info_flow_score"]].copy()
+            score_cols = ranked[
+                ["ticker", "activity_score", "market_activity_score", "info_flow_score", "filing_flag", "filing_count"]
+            ].copy()
             all_stocks = universe_df.merge(score_cols, on="ticker", how="left")
             all_stocks = all_stocks.sort_values(["company_name", "ticker"]).reset_index(drop=True)
 
@@ -936,14 +1167,63 @@ def main() -> None:
                     all_stocks["ticker"].str.contains(all_stocks_query, na=False)
                     | all_stocks["company_name"].str.upper().str.contains(all_stocks_query, na=False)
                 ]
-            st.dataframe(
-                all_stocks[
-                    ["company_name", "ticker", "activity_score", "market_activity_score", "info_flow_score"]
-                ],
-                use_container_width=True,
-                hide_index=True,
-                height=320,
-            )
+
+            display_cols = [
+                "company_name",
+                "ticker",
+                "activity_score",
+                "market_activity_score",
+                "info_flow_score",
+                "filing_flag",
+                "filing_count",
+            ]
+            table_df = all_stocks[display_cols].reset_index(drop=True)
+
+            try:
+                st.dataframe(
+                    table_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=320,
+                    selection_mode="single-row",
+                    on_select="rerun",
+                    key="all_stocks_table",
+                )
+                rows: list[int] = []
+                state = st.session_state.get("all_stocks_table", {})
+                if isinstance(state, dict):
+                    sel = state.get("selection", {})
+                    if isinstance(sel, dict):
+                        rows = sel.get("rows", []) or []
+                if rows:
+                    idx = int(rows[0])
+                    if 0 <= idx < len(table_df):
+                        picked_ticker = str(table_df.iloc[idx]["ticker"]).upper()
+                        st.session_state["selected_ticker"] = picked_ticker
+                if st.session_state.get("selected_ticker"):
+                    st.caption(f"Selected from table: {st.session_state['selected_ticker']}")
+            except TypeError:
+                # Fallback for older Streamlit versions without dataframe row selection.
+                st.dataframe(
+                    table_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=320,
+                )
+                option_map = {
+                    f"{row['company_name']} ({row['ticker']})": str(row["ticker"]).upper()
+                    for _, row in table_df.iterrows()
+                }
+                picked = st.selectbox(
+                    "Select a ticker from search results",
+                    options=[""] + list(option_map.keys()),
+                    index=0,
+                    key="all_stocks_fallback_select",
+                )
+                if picked:
+                    picked_ticker = option_map[picked]
+                    st.session_state["selected_ticker"] = picked_ticker
+                    st.caption(f"Selected from table: {st.session_state['selected_ticker']}")
         except Exception as exc:
             st.warning(f"Unable to load S&P 500 name list: {exc}")
 
@@ -962,6 +1242,7 @@ def main() -> None:
                         "mention_count",
                         "source_diversity",
                         "filing_flag",
+                        "filing_count",
                         "selection_reason",
                     ]
                 ],
@@ -985,13 +1266,9 @@ def main() -> None:
             )
 
         st.subheader("Ticker Lookup")
-        ticker_query = st.text_input(
-            "Search ticker",
-            value="",
-            key="ticker_search_text",
-            placeholder="Type ticker (e.g., NVDA) and press Enter",
-        ).strip().upper()
-        selected_ticker = ticker_query
+        selected_ticker = str(st.session_state.get("selected_ticker", "")).upper()
+        if selected_ticker:
+            st.session_state["selected_ticker"] = selected_ticker
         selected_ticker_for_notes = selected_ticker
 
         selected_row = pd.DataFrame()
@@ -1006,10 +1283,11 @@ def main() -> None:
                     )
 
         if not selected_ticker:
-            st.info("Enter a ticker symbol to view activity score and details.")
+            st.info("Select a ticker in 'All US Stocks (S&P 500)' to view activity score and details.")
         elif selected_row.empty:
             st.warning(f"No data available for {selected_ticker}.")
         else:
+            st.caption(f"Showing ticker: {selected_ticker}")
             summary_cols = [
                 "ticker",
                 "activity_score",
@@ -1020,6 +1298,7 @@ def main() -> None:
                 "mention_count",
                 "source_diversity",
                 "filing_flag",
+                "filing_count",
                 "selection_reason",
             ]
             st.dataframe(
@@ -1031,16 +1310,10 @@ def main() -> None:
 
         st.subheader("Ticker Details")
         if not selected_ticker:
-            st.info("Enter a ticker to load details.")
+            st.info("Select a ticker in 'All US Stocks (S&P 500)' to load details.")
         else:
-            timeframe = st.radio(
-                "Timeframe",
-                options=["1D", "5D", "1M", "3M", "6M", "1Y"],
-                index=0,
-                horizontal=True,
-                key="detail_timeframe",
-            )
             try:
+                timeframe = str(st.session_state.get("detail_timeframe", "1D"))
                 snap = get_ticker_detail_snapshot(selected_ticker, timeframe)
                 if snap["price_value"] is None:
                     st.warning("No pricing data available for selected ticker.")
@@ -1062,6 +1335,17 @@ def main() -> None:
                     else:
                         st.markdown(f"## {price_text}")
                     st.caption(snap["price_label"])
+                    timeframe = st.radio(
+                        "Timeframe",
+                        options=["1D", "5D", "1M", "3M", "6M", "1Y"],
+                        index=["1D", "5D", "1M", "3M", "6M", "1Y"].index(timeframe)
+                        if timeframe in {"1D", "5D", "1M", "3M", "6M", "1Y"}
+                        else 0,
+                        horizontal=True,
+                        key="detail_timeframe",
+                    )
+                    # Fetch again so chart reflects the current radio value while keeping control below price.
+                    snap = get_ticker_detail_snapshot(selected_ticker, timeframe)
 
                     if go is None:
                         st.line_chart(snap["chart"], x="Date", y="Close", use_container_width=True)
@@ -1220,6 +1504,101 @@ def main() -> None:
                         hide_index=True,
                         height="content",
                     )
+
+                    st.subheader("SEC Filings (recent)")
+                    sec_data = None
+                    if not selected_row.empty:
+                        row0 = selected_row.iloc[0]
+                        sec_data = {
+                            "filing_flag": bool(row0.get("filing_flag", False)),
+                            "filing_count": int(row0.get("filing_count", 0) or 0),
+                            "filing_types": row0.get("filing_types", []) or [],
+                            "latest_filing_time": str(row0.get("latest_filing_time", "") or ""),
+                            "filing_links": row0.get("filing_links", []) or [],
+                        }
+                    if sec_data is None:
+                        sec_data = get_recent_sec_filings_for_ticker(
+                            selected_ticker, lookback_days=SEC_LOOKBACK_DAYS_DEFAULT
+                        )
+
+                    if not sec_data.get("filing_flag", False):
+                        st.caption(
+                            f"No 8-K / 4 / 10-Q / 10-K filings in the last {SEC_LOOKBACK_DAYS_DEFAULT} days."
+                        )
+                    else:
+                        st.caption(
+                            f"Found {int(sec_data.get('filing_count', 0))} filing(s). "
+                            f"Latest: {sec_data.get('latest_filing_time', '-')}"
+                        )
+                        types_text = ", ".join(sec_data.get("filing_types", []) or [])
+                        if types_text:
+                            st.write(f"Types: {types_text}")
+                        links = sec_data.get("filing_links", []) or []
+                        if links:
+                            for idx, link in enumerate(links[:3], start=1):
+                                st.markdown(f"- [SEC filing {idx}]({link})")
+
+                    st.subheader("On-Demand Analysis")
+                    analyze_clicked = st.button(
+                        "Analyze this ticker now (paper research)",
+                        key=f"analyze_ticker_btn_{selected_ticker}",
+                    )
+                    if analyze_clicked:
+                        row_metrics = {}
+                        if not selected_row.empty:
+                            row0 = selected_row.iloc[0]
+                            row_metrics = {
+                                "move_pct_1d": float(row0.get("price_move_pct", 0.0) or 0.0),
+                                "volume_ratio": float(row0.get("volume_ratio", 1.0) or 1.0),
+                                "mention_count": int(row0.get("mention_count", 0) or 0),
+                                "source_diversity": int(row0.get("source_diversity", 0) or 0),
+                                "sentiment_shift": float(row0.get("sentiment_shift", 0.0) or 0.0),
+                                "filing_flag": bool(row0.get("filing_flag", False)),
+                                "filing_count": int(row0.get("filing_count", 0) or 0),
+                            }
+                        else:
+                            row_metrics = {
+                                "move_pct_1d": 0.0,
+                                "volume_ratio": 1.0,
+                                "mention_count": 0,
+                                "source_diversity": 0,
+                                "sentiment_shift": 0.0,
+                                "filing_flag": bool(sec_data.get("filing_flag", False)),
+                                "filing_count": int(sec_data.get("filing_count", 0) or 0),
+                            }
+
+                        news_bundle = get_ticker_news_items(
+                            selected_ticker,
+                            lookback_hours=lookback_hours,
+                            max_items=15,
+                        )
+                        sec_bundle = {
+                            "filing_flag": bool(sec_data.get("filing_flag", False)),
+                            "filing_count": int(sec_data.get("filing_count", 0) or 0),
+                            "filing_types": sec_data.get("filing_types", []) or [],
+                            "filing_dates": sec_data.get("filing_dates", []) or [],
+                            "latest_filing_time": str(sec_data.get("latest_filing_time", "") or ""),
+                            "filing_links": (sec_data.get("filing_links", []) or [])[:3],
+                            "filings": (sec_data.get("filings", []) or [])[:10],
+                        }
+                        evidence_bundle = {
+                            "ticker": selected_ticker,
+                            "as_of_utc": datetime.now(UTC).isoformat(),
+                            "metrics_today": row_metrics,
+                            "yahoo_news_items": news_bundle,
+                            "sec_edgar_recent_filings": sec_bundle,
+                        }
+                        codex_prompt = build_codex_ticker_prompt(evidence_bundle)
+
+                        st.markdown("Evidence bundle JSON")
+                        st.code(json.dumps(evidence_bundle, ensure_ascii=True, indent=2), language="json")
+                        st.markdown("Codex-ready prompt")
+                        st.text_area(
+                            "Copy this prompt into Codex",
+                            value=codex_prompt,
+                            height=360,
+                            key=f"codex_prompt_{selected_ticker}",
+                        )
             except Exception as exc:
                 st.warning(f"Unable to load ticker details: {exc}")
 
